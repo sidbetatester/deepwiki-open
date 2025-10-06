@@ -44,6 +44,23 @@ interface WikiStructure {
   rootSections: string[];
 }
 
+type PageGenerationStatus = {
+  status: 'pending' | 'in-progress' | 'success' | 'error';
+  attempts: number;
+  lastError?: string;
+};
+
+type PageGenerationResult = {
+  success: boolean;
+  attempts: number;
+  willRetry: boolean;
+  errorMessage?: string;
+};
+
+const MAX_PAGE_GENERATION_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1500;
+const RETRY_MAX_DELAY_MS = 10000;
+
 // Add CSS styles for wiki with Japanese aesthetic
 const wikiStyles = `
   .prose code {
@@ -223,6 +240,11 @@ export default function RepoWikiPage() {
   const [currentPageId, setCurrentPageId] = useState<string | undefined>();
   const [generatedPages, setGeneratedPages] = useState<Record<string, WikiPage>>({});
   const [pagesInProgress, setPagesInProgress] = useState(new Set<string>());
+  const [pageGenerationState, setPageGenerationState] = useState<Record<string, PageGenerationStatus>>({});
+  const pageGenerationStateRef = useRef(pageGenerationState);
+  const [totalPages, setTotalPages] = useState(0);
+  const retryTimeoutsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const pendingRetriesRef = useRef(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [originalMarkdown, setOriginalMarkdown] = useState<Record<string, string>>({});
@@ -308,6 +330,60 @@ export default function RepoWikiPage() {
     return filePath;
   }, [effectiveRepoInfo, defaultBranch]);
 
+  useEffect(() => {
+    pageGenerationStateRef.current = pageGenerationState;
+  }, [pageGenerationState, pageGenerationStateRef]);
+
+  useEffect(() => {
+    return () => {
+      retryTimeoutsRef.current.forEach(timeoutId => clearTimeout(timeoutId));
+      retryTimeoutsRef.current = [];
+      pendingRetriesRef.current = 0;
+    };
+  }, []);
+
+  const pageStatusEntries = useMemo(() => Object.entries(pageGenerationState), [pageGenerationState]);
+  const completedPageCount = useMemo(
+    () => pageStatusEntries.filter(([, status]) => status.status === 'success').length,
+    [pageStatusEntries]
+  );
+  const failedPageEntries = useMemo(
+    () => pageStatusEntries.filter(([, status]) => status.status === 'error'),
+    [pageStatusEntries]
+  );
+  const totalPageCount = totalPages || wikiStructure?.pages.length || 0;
+  const progressPercentage = useMemo(() => {
+    if (!totalPageCount) {
+      return 0;
+    }
+    const rawPercent = (completedPageCount / totalPageCount) * 100;
+    return Math.max(5, Math.round(rawPercent));
+  }, [completedPageCount, totalPageCount]);
+  const generationInProgress = useMemo(() => {
+    if (!wikiStructure) {
+      return false;
+    }
+    const hasPendingOrRunning = pageStatusEntries.some(([, status]) =>
+      status.status === 'pending' || status.status === 'in-progress'
+    );
+    return hasPendingOrRunning || pagesInProgress.size > 0;
+  }, [wikiStructure, pageStatusEntries, pagesInProgress.size]);
+  const pendingPageCount = Math.max(0, totalPageCount - completedPageCount - failedPageEntries.length);
+  const progressLabel = useMemo(() => {
+    if (!totalPageCount) {
+      return '';
+    }
+    if (language === 'ja') {
+      return `${completedPageCount}ページ完了（全${totalPageCount}ページ中）`;
+    }
+    if (messages.repoPage?.pagesCompleted) {
+      return messages.repoPage.pagesCompleted
+        .replace('{completed}', completedPageCount.toString())
+        .replace('{total}', totalPageCount.toString());
+    }
+    return `${completedPageCount} of ${totalPageCount} pages completed`;
+  }, [completedPageCount, totalPageCount, language, messages.repoPage?.pagesCompleted]);
+
   // Memoize repo info to avoid triggering updates in callbacks
 
   // Add useEffect to handle scroll reset
@@ -361,53 +437,65 @@ export default function RepoWikiPage() {
   }, []);
 
   // Generate content for a wiki page
-  const generatePageContent = useCallback(async (page: WikiPage, owner: string, repo: string) => {
-    return new Promise<void>(async (resolve) => {
-      try {
-        // Skip if content already exists
-        if (generatedPages[page.id]?.content) {
-          resolve();
-          return;
+  const generatePageContent = useCallback(async (page: WikiPage, owner: string, repo: string): Promise<PageGenerationResult> => {
+    const existingStatus = pageGenerationStateRef.current[page.id];
+
+    if (existingStatus?.status === 'success') {
+      return { success: true, attempts: existingStatus.attempts, willRetry: false };
+    }
+
+    if (activeContentRequests.get(page.id)) {
+      console.log(`Page ${page.id} (${page.title}) is already being processed, skipping duplicate call`);
+      return {
+        success: false,
+        attempts: existingStatus?.attempts ?? 0,
+        willRetry: true
+      };
+    }
+
+    const currentAttempt = (existingStatus?.attempts ?? 0) + 1;
+
+    if (!owner || !repo) {
+      const message = 'Invalid repository information. Owner and repo name are required.';
+      setPageGenerationState(prev => ({
+        ...prev,
+        [page.id]: {
+          status: 'error',
+          attempts: currentAttempt,
+          lastError: message
         }
+      }));
+      return { success: false, attempts: currentAttempt, willRetry: false, errorMessage: message };
+    }
 
-        // Skip if this page is already being processed
-        // Use a synchronized pattern to avoid race conditions
-        if (activeContentRequests.get(page.id)) {
-          console.log(`Page ${page.id} (${page.title}) is already being processed, skipping duplicate call`);
-          resolve();
-          return;
-        }
+    activeContentRequests.set(page.id, true);
 
-        // Mark this page as being processed immediately to prevent race conditions
-        // This ensures that if multiple calls happen nearly simultaneously, only one proceeds
-        activeContentRequests.set(page.id, true);
+    const filePaths = page.filePaths;
+    const placeholderMessage = currentAttempt > 1
+      ? `Attempt ${currentAttempt} in progress...`
+      : 'Loading...';
 
-        // Validate repo info
-        if (!owner || !repo) {
-          throw new Error('Invalid repository information. Owner and repo name are required.');
-        }
+    setPageGenerationState(prev => ({
+      ...prev,
+      [page.id]: {
+        status: 'in-progress',
+        attempts: currentAttempt,
+        lastError: undefined
+      }
+    }));
 
-        // Mark page as in progress
-        setPagesInProgress(prev => new Set(prev).add(page.id));
-        // Don't set loading message for individual pages during queue processing
+    setGeneratedPages(prev => ({
+      ...prev,
+      [page.id]: { ...page, content: placeholderMessage }
+    }));
+    setOriginalMarkdown(prev => ({ ...prev, [page.id]: '' }));
 
-        const filePaths = page.filePaths;
+    try {
+      console.log(`Starting content generation for page: ${page.title} (attempt ${currentAttempt})`);
 
-        // Store the initially generated content BEFORE rendering/potential modification
-        setGeneratedPages(prev => ({
-          ...prev,
-          [page.id]: { ...page, content: 'Loading...' } // Placeholder
-        }));
-        setOriginalMarkdown(prev => ({ ...prev, [page.id]: '' })); // Clear previous original
+      const repoUrl = getRepoUrl(effectiveRepoInfo);
 
-        // Make API call to generate page content
-        console.log(`Starting content generation for page: ${page.title}`);
-
-        // Get repository URL
-        const repoUrl = getRepoUrl(effectiveRepoInfo);
-
-        // Create the prompt content - simplified to avoid message dialogs
- const promptContent =
+      const promptContent =
 `You are an expert technical writer and software architect.
 Your task is to generate a comprehensive and accurate technical wiki page in Markdown format about a specific feature, system, or module within a given software project.
 
@@ -487,7 +575,7 @@ IMPORTANT: Generate the content in ${language === 'en' ? 'English' :
             language === 'zh-tw' ? 'Traditional Chinese (繁體中文)' :
             language === 'es' ? 'Spanish (Español)' :
             language === 'kr' ? 'Korean (한국어)' :
-            language === 'vi' ? 'Vietnamese (Tiếng Việt)' : 
+            language === 'vi' ? 'Vietnamese (Tiếng Việt)' :
             language === "pt-br" ? "Brazilian Portuguese (Português Brasileiro)" :
             language === "fr" ? "Français (French)" :
             language === "ru" ? "Русский (Russian)" :
@@ -499,160 +587,184 @@ Remember:
 - Structure the document logically for easy understanding by other developers.
 `;
 
-        // Prepare request body
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const requestBody: Record<string, any> = {
-          repo_url: repoUrl,
-          type: effectiveRepoInfo.type,
-          messages: [{
-            role: 'user',
-            content: promptContent
-          }]
-        };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const requestBody: Record<string, any> = {
+        repo_url: repoUrl,
+        type: effectiveRepoInfo.type,
+        messages: [{
+          role: 'user',
+          content: promptContent
+        }]
+      };
 
-        // Add tokens if available
-        addTokensToRequestBody(requestBody, currentToken, effectiveRepoInfo.type, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles);
+      addTokensToRequestBody(
+        requestBody,
+        currentToken,
+        effectiveRepoInfo.type,
+        selectedProviderState,
+        selectedModelState,
+        isCustomSelectedModelState,
+        customSelectedModelState,
+        language,
+        modelExcludedDirs,
+        modelExcludedFiles,
+        modelIncludedDirs,
+        modelIncludedFiles
+      );
 
-        // Use WebSocket for communication
-        let content = '';
+      let content = '';
 
-        try {
-          // Create WebSocket URL from the server base URL
-          const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
-          const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws')? serverBaseUrl.replace(/^https/, 'wss'): serverBaseUrl.replace(/^http/, 'ws');
-          const wsUrl = `${wsBaseUrl}/ws/chat`;
+      try {
+        const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
+        const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws') ? serverBaseUrl.replace(/^https/, 'wss') : serverBaseUrl.replace(/^http/, 'ws');
+        const wsUrl = `${wsBaseUrl}/ws/chat`;
+        const ws = new WebSocket(wsUrl);
 
-          // Create a new WebSocket connection
-          const ws = new WebSocket(wsUrl);
+        await new Promise<void>((resolve, reject) => {
+          ws.onopen = () => {
+            console.log(`WebSocket connection established for page: ${page.title}`);
+            ws.send(JSON.stringify(requestBody));
+            resolve();
+          };
 
-          // Create a promise that resolves when the WebSocket connection is complete
-          await new Promise<void>((resolve, reject) => {
-            // Set up event handlers
-            ws.onopen = () => {
-              console.log(`WebSocket connection established for page: ${page.title}`);
-              // Send the request as JSON
-              ws.send(JSON.stringify(requestBody));
-              resolve();
-            };
+          ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            reject(new Error('WebSocket connection failed'));
+          };
 
-            ws.onerror = (error) => {
-              console.error('WebSocket error:', error);
-              reject(new Error('WebSocket connection failed'));
-            };
+          const timeout = setTimeout(() => {
+            reject(new Error('WebSocket connection timeout'));
+          }, 5000);
 
-            // If the connection doesn't open within 5 seconds, fall back to HTTP
-            const timeout = setTimeout(() => {
-              reject(new Error('WebSocket connection timeout'));
-            }, 5000);
+          ws.onopen = () => {
+            clearTimeout(timeout);
+            console.log(`WebSocket connection established for page: ${page.title}`);
+            ws.send(JSON.stringify(requestBody));
+            resolve();
+          };
+        });
 
-            // Clear the timeout if the connection opens successfully
-            ws.onopen = () => {
-              clearTimeout(timeout);
-              console.log(`WebSocket connection established for page: ${page.title}`);
-              // Send the request as JSON
-              ws.send(JSON.stringify(requestBody));
-              resolve();
-            };
-          });
+        await new Promise<void>((resolve, reject) => {
+          ws.onmessage = (event) => {
+            content += event.data;
+          };
 
-          // Create a promise that resolves when the WebSocket response is complete
-          await new Promise<void>((resolve, reject) => {
-            // Handle incoming messages
-            ws.onmessage = (event) => {
-              content += event.data;
-            };
+          ws.onclose = () => {
+            console.log(`WebSocket connection closed for page: ${page.title}`);
+            resolve();
+          };
 
-            // Handle WebSocket close
-            ws.onclose = () => {
-              console.log(`WebSocket connection closed for page: ${page.title}`);
-              resolve();
-            };
+          ws.onerror = (error) => {
+            console.error('WebSocket error during message reception:', error);
+            reject(new Error('WebSocket error during message reception'));
+          };
+        });
+      } catch (wsError) {
+        console.error('WebSocket error, falling back to HTTP:', wsError);
 
-            // Handle WebSocket errors
-            ws.onerror = (error) => {
-              console.error('WebSocket error during message reception:', error);
-              reject(new Error('WebSocket error during message reception'));
-            };
-          });
-        } catch (wsError) {
-          console.error('WebSocket error, falling back to HTTP:', wsError);
+        const response = await fetch(`/api/chat/stream`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody)
+        });
 
-          // Fall back to HTTP if WebSocket fails
-          const response = await fetch(`/api/chat/stream`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestBody)
-          });
-
-          if (!response.ok) {
-            const errorText = await response.text().catch(() => 'No error details available');
-            console.error(`API error (${response.status}): ${errorText}`);
-            throw new Error(`Error generating page content: ${response.status} - ${response.statusText}`);
-          }
-
-          // Process the response
-          content = '';
-          const reader = response.body?.getReader();
-          const decoder = new TextDecoder();
-
-          if (!reader) {
-            throw new Error('Failed to get response reader');
-          }
-
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              content += decoder.decode(value, { stream: true });
-            }
-            // Ensure final decoding
-            content += decoder.decode();
-          } catch (readError) {
-            console.error('Error reading stream:', readError);
-            throw new Error('Error processing response stream');
-          }
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => 'No error details available');
+          console.error(`API error (${response.status}): ${errorText}`);
+          throw new Error(`Error generating page content: ${response.status} - ${response.statusText}`);
         }
 
-        // Clean up markdown delimiters
-        content = content.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
+        content = '';
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
 
-        console.log(`Received content for ${page.title}, length: ${content.length} characters`);
+        if (!reader) {
+          throw new Error('Failed to get response reader');
+        }
 
-        // Store the FINAL generated content
-        const updatedPage = { ...page, content };
-        setGeneratedPages(prev => ({ ...prev, [page.id]: updatedPage }));
-        // Store this as the original for potential mermaid retries
-        setOriginalMarkdown(prev => ({ ...prev, [page.id]: content }));
-
-        resolve();
-      } catch (err) {
-        console.error(`Error generating content for page ${page.id}:`, err);
-        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-        // Update page state to show error
-        setGeneratedPages(prev => ({
-          ...prev,
-          [page.id]: { ...page, content: `Error generating content: ${errorMessage}` }
-        }));
-        setError(`Failed to generate content for ${page.title}.`);
-        resolve(); // Resolve even on error to unblock queue
-      } finally {
-        // Clear the processing flag for this page
-        // This must happen in the finally block to ensure the flag is cleared
-        // even if an error occurs during processing
-        activeContentRequests.delete(page.id);
-
-        // Mark page as done
-        setPagesInProgress(prev => {
-          const next = new Set(prev);
-          next.delete(page.id);
-          return next;
-        });
-        setLoadingMessage(undefined); // Clear specific loading message
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            content += decoder.decode(value, { stream: true });
+          }
+          content += decoder.decode();
+        } catch (readError) {
+          console.error('Error reading stream:', readError);
+          throw new Error('Error processing response stream');
+        }
       }
-    });
-  }, [generatedPages, currentToken, effectiveRepoInfo, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, language, activeContentRequests, generateFileUrl]);
+
+      content = content.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
+
+      console.log(`Received content for ${page.title}, length: ${content.length} characters`);
+
+      const updatedPage = { ...page, content };
+      setGeneratedPages(prev => ({ ...prev, [page.id]: updatedPage }));
+      setOriginalMarkdown(prev => ({ ...prev, [page.id]: content }));
+      setPageGenerationState(prev => ({
+        ...prev,
+        [page.id]: {
+          status: 'success',
+          attempts: currentAttempt,
+          lastError: undefined
+        }
+      }));
+
+      return { success: true, attempts: currentAttempt, willRetry: false };
+    } catch (err) {
+      console.error(`Error generating content for page ${page.id} (attempt ${currentAttempt}):`, err);
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      const canRetry = currentAttempt < MAX_PAGE_GENERATION_RETRIES;
+
+      setGeneratedPages(prev => ({
+        ...prev,
+        [page.id]: {
+          ...page,
+          content: canRetry
+            ? `Retrying... (attempt ${currentAttempt} failed: ${errorMessage})`
+            : `Error generating content: ${errorMessage}`
+        }
+      }));
+
+      setPageGenerationState(prev => ({
+        ...prev,
+        [page.id]: {
+          status: canRetry ? 'pending' : 'error',
+          attempts: currentAttempt,
+          lastError: errorMessage
+        }
+      }));
+
+      return {
+        success: false,
+        attempts: currentAttempt,
+        willRetry: canRetry,
+        errorMessage
+      };
+    } finally {
+      activeContentRequests.delete(page.id);
+    }
+  }, [
+    activeContentRequests,
+    currentToken,
+    customSelectedModelState,
+    effectiveRepoInfo,
+    generateFileUrl,
+    isCustomSelectedModelState,
+    language,
+    modelExcludedDirs,
+    modelExcludedFiles,
+    modelIncludedDirs,
+    modelIncludedFiles,
+    pageGenerationStateRef,
+    selectedModelState,
+    selectedProviderState,
+    setOriginalMarkdown
+  ]);
+
 
   // Determine the wiki structure from repository data
   const determineWikiStructure = useCallback(async (fileTree: string, readme: string, owner: string, repo: string) => {
@@ -1058,74 +1170,107 @@ IMPORTANT:
 
       setWikiStructure(wikiStructure);
       setCurrentPageId(pages.length > 0 ? pages[0].id : undefined);
+      setTotalPages(pages.length);
 
-      // Start generating content for all pages with controlled concurrency
+      const initialStatuses: Record<string, PageGenerationStatus> = {};
+      pages.forEach(pageItem => {
+        initialStatuses[pageItem.id] = {
+          status: 'pending',
+          attempts: 0,
+          lastError: undefined
+        };
+      });
+      setPageGenerationState(initialStatuses);
+      setPagesInProgress(new Set());
+
+      retryTimeoutsRef.current.forEach(timeoutId => clearTimeout(timeoutId));
+      retryTimeoutsRef.current = [];
+      pendingRetriesRef.current = 0;
+
       if (pages.length > 0) {
-        // Mark all pages as in progress
-        const initialInProgress = new Set(pages.map(p => p.id));
-        setPagesInProgress(initialInProgress);
-
         console.log(`Starting generation for ${pages.length} pages with controlled concurrency`);
+        setLoadingMessage(messages.loading?.generatingPages || 'Generating wiki pages...');
 
-        // Maximum concurrent requests
+        const queue: WikiPage[] = [...pages];
+        let activeRequests = 0;
         const MAX_CONCURRENT = 1;
 
-        // Create a queue of pages
-        const queue = [...pages];
-        let activeRequests = 0;
-
-        // Function to process next items in queue
-        const processQueue = () => {
-          // Process as many items as we can up to our concurrency limit
-          while (queue.length > 0 && activeRequests < MAX_CONCURRENT) {
-            const page = queue.shift();
-            if (page) {
-              activeRequests++;
-              console.log(`Starting page ${page.title} (${activeRequests} active, ${queue.length} remaining)`);
-
-              // Start generating content for this page
-              generatePageContent(page, owner, repo)
-                .finally(() => {
-                  // When done (success or error), decrement active count and process more
-                  activeRequests--;
-                  console.log(`Finished page ${page.title} (${activeRequests} active, ${queue.length} remaining)`);
-
-                  // Check if all work is done (queue empty and no active requests)
-                  if (queue.length === 0 && activeRequests === 0) {
-                    console.log("All page generation tasks completed.");
-                    setIsLoading(false);
-                    setLoadingMessage(undefined);
-                  } else {
-                    // Only process more if there are items remaining and we're under capacity
-                    if (queue.length > 0 && activeRequests < MAX_CONCURRENT) {
-                      processQueue();
-                    }
-                  }
-                });
+        const startNext = () => {
+          if (queue.length === 0 || activeRequests >= MAX_CONCURRENT) {
+            if (queue.length === 0 && activeRequests === 0 && pendingRetriesRef.current === 0) {
+              console.log('All page generation tasks completed.');
+              setIsLoading(false);
+              setLoadingMessage(undefined);
             }
+            return;
           }
 
-          // Additional check: If the queue started empty or becomes empty and no requests were started/active
-          if (queue.length === 0 && activeRequests === 0 && pages.length > 0 && pagesInProgress.size === 0) {
-            // This handles the case where the queue might finish before the finally blocks fully update activeRequests
-            // or if the initial queue was processed very quickly
-            console.log("Queue empty and no active requests after loop, ensuring loading is false.");
-            setIsLoading(false);
-            setLoadingMessage(undefined);
-          } else if (pages.length === 0) {
-            // Handle case where there were no pages to begin with
-            setIsLoading(false);
-            setLoadingMessage(undefined);
+          const nextPage = queue.shift();
+          if (!nextPage) {
+            return;
           }
+
+          activeRequests += 1;
+          setPagesInProgress(prev => {
+            const next = new Set(prev);
+            next.add(nextPage.id);
+            return next;
+          });
+
+          generatePageContent(nextPage, owner, repo)
+            .then(result => {
+              if (!result.success && result.willRetry) {
+                const backoffDelay = Math.min(
+                  RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, result.attempts - 1)),
+                  RETRY_MAX_DELAY_MS
+                );
+                pendingRetriesRef.current += 1;
+                const timeoutHandle = setTimeout(() => {
+                  pendingRetriesRef.current = Math.max(0, pendingRetriesRef.current - 1);
+                  retryTimeoutsRef.current = retryTimeoutsRef.current.filter(handle => handle !== timeoutHandle);
+                  queue.push(nextPage);
+                  startNext();
+                }, backoffDelay);
+                retryTimeoutsRef.current.push(timeoutHandle);
+              } else if (!result.success) {
+                console.warn(`Page ${nextPage.title} failed after ${result.attempts} attempts: ${result.errorMessage || 'unknown error'}`);
+              }
+            })
+            .catch(err => {
+              console.error(`Unexpected error generating page ${nextPage.id}:`, err);
+              setPageGenerationState(prev => ({
+                ...prev,
+                [nextPage.id]: {
+                  status: 'error',
+                  attempts: prev[nextPage.id]?.attempts ?? 0,
+                  lastError: err instanceof Error ? err.message : String(err)
+                }
+              }));
+            })
+            .finally(() => {
+              activeRequests -= 1;
+              setPagesInProgress(prev => {
+                const next = new Set(prev);
+                next.delete(nextPage.id);
+                return next;
+              });
+
+              if (queue.length > 0 && activeRequests < MAX_CONCURRENT) {
+                startNext();
+              } else if (queue.length === 0 && activeRequests === 0 && pendingRetriesRef.current === 0) {
+                console.log('All page generation tasks completed.');
+                setIsLoading(false);
+                setLoadingMessage(undefined);
+              }
+            });
         };
 
-        // Start processing the queue
-        processQueue();
+        startNext();
       } else {
-        // Set loading to false if there were no pages found
         setIsLoading(false);
         setLoadingMessage(undefined);
       }
+
 
     } catch (error) {
       console.error('Error determining wiki structure:', error);
@@ -1135,7 +1280,7 @@ IMPORTANT:
     } finally {
       setStructureRequestInProgress(false);
     }
-  }, [generatePageContent, currentToken, effectiveRepoInfo, pagesInProgress.size, structureRequestInProgress, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, language, messages.loading, isComprehensiveView]);
+  }, [generatePageContent, currentToken, effectiveRepoInfo, structureRequestInProgress, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, language, messages.loading, isComprehensiveView]);
 
   // Fetch repository structure using GitHub or GitLab API
   const fetchRepositoryStructure = useCallback(async () => {
@@ -1150,6 +1295,8 @@ IMPORTANT:
     setCurrentPageId(undefined);
     setGeneratedPages({});
     setPagesInProgress(new Set());
+    setPageGenerationState({});
+    setTotalPages(0);
     setError(null);
     setEmbeddingError(false); // Reset embedding error state
 
@@ -1639,6 +1786,8 @@ IMPORTANT:
     setCurrentPageId(undefined);
     setGeneratedPages({});
     setPagesInProgress(new Set());
+    setPageGenerationState({});
+    setTotalPages(0);
     setError(null);
     setEmbeddingError(false); // Reset embedding error state
     setIsLoading(true); // Set loading state for refresh
@@ -1646,6 +1795,9 @@ IMPORTANT:
 
     // Clear any in-progress requests for page content
     activeContentRequests.clear();
+    retryTimeoutsRef.current.forEach(timeoutId => clearTimeout(timeoutId));
+    retryTimeoutsRef.current = [];
+    pendingRetriesRef.current = 0;
     // Reset flags related to request processing if they are component-wide
     setStructureRequestInProgress(false); // Assuming this flag should be reset
     setRequestInProgress(false); // Assuming this flag should be reset
@@ -1816,9 +1968,20 @@ IMPORTANT:
 
               setWikiStructure(cachedStructure);
               setGeneratedPages(cachedData.generated_pages);
+              setTotalPages(cachedStructure.pages.length);
+              const cachedStatuses: Record<string, PageGenerationStatus> = {};
+              cachedStructure.pages.forEach(pageItem => {
+                cachedStatuses[pageItem.id] = {
+                  status: 'success',
+                  attempts: 1,
+                  lastError: undefined
+                };
+              });
+              setPageGenerationState(cachedStatuses);
+              setPagesInProgress(new Set());
               setCurrentPageId(cachedStructure.pages.length > 0 ? cachedStructure.pages[0].id : undefined);
               setIsLoading(false);
-              setEmbeddingError(false); 
+              setEmbeddingError(false);
               setLoadingMessage(undefined);
               cacheLoadedSuccessfully.current = true;
               return; // Exit if cache is successfully loaded
@@ -1902,7 +2065,7 @@ IMPORTANT:
     };
 
     saveCache();
-  }, [isLoading, error, wikiStructure, generatedPages, effectiveRepoInfo.owner, effectiveRepoInfo.repo, effectiveRepoInfo.type, effectiveRepoInfo.repoUrl, repoUrl, language, isComprehensiveView]);
+  }, [isLoading, error, wikiStructure, generatedPages, effectiveRepoInfo, repoUrl, language, isComprehensiveView, selectedProviderState, selectedModelState]);
 
   const handlePageSelect = (pageId: string) => {
     if (currentPageId != pageId) {
@@ -1927,7 +2090,7 @@ IMPORTANT:
       </header>
 
       <main className="flex-1 max-w-[90%] xl:max-w-[1400px] mx-auto overflow-y-auto">
-        {isLoading ? (
+        {(isLoading && !wikiStructure) ? (
           <div className="flex flex-col items-center justify-center p-8 bg-[var(--card-bg)] rounded-lg shadow-custom card-japanese">
             <div className="relative mb-6">
               <div className="absolute -inset-4 bg-[var(--accent-primary)]/10 rounded-full blur-md animate-pulse"></div>
@@ -2014,7 +2177,86 @@ IMPORTANT:
             </div>
           </div>
         ) : wikiStructure ? (
-          <div className="h-full overflow-y-auto flex flex-col lg:flex-row gap-4 w-full overflow-hidden bg-[var(--card-bg)] rounded-lg shadow-custom card-japanese">
+          <>
+            {(generationInProgress || failedPageEntries.length > 0) && (
+              <div className="bg-[var(--background)]/60 border border-[var(--border-color)] rounded-lg p-4 mb-5 shadow-sm">
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                    <p className="text-sm font-serif text-[var(--foreground)]">
+                      {messages.repoPage?.progressTitle || 'Wiki page generation progress'}
+                    </p>
+                    {totalPageCount > 0 && progressLabel && (
+                      <span className="text-xs text-[var(--muted)]">{progressLabel}</span>
+                    )}
+                  </div>
+                  {totalPageCount > 0 && (
+                    <div className="bg-[var(--background)] rounded-full h-2 border border-[var(--border-color)] overflow-hidden">
+                      <div
+                        className="bg-[var(--accent-primary)] h-2 transition-all duration-300 ease-in-out"
+                        style={{ width: `${progressPercentage}%` }}
+                      />
+                    </div>
+                  )}
+                  {generationInProgress && pendingPageCount > 0 && (
+                    <div className="text-xs text-[var(--muted)]">
+                      {messages.repoPage?.pagesRemaining
+                        ? messages.repoPage.pagesRemaining.replace('{remaining}', pendingPageCount.toString())
+                        : `${pendingPageCount} page${pendingPageCount === 1 ? '' : 's'} queued for generation`}
+                    </div>
+                  )}
+                  {pagesInProgress.size > 0 && (
+                    <div className="text-xs">
+                      <p className="text-[var(--muted)] mb-1">
+                        {messages.repoPage?.currentlyProcessing || 'Currently processing:'}
+                      </p>
+                      <ul className="text-[var(--foreground)] space-y-1">
+                        {Array.from(pagesInProgress).slice(0, 3).map(pageId => {
+                          const page = wikiStructure.pages.find(p => p.id === pageId);
+                          return page ? (
+                            <li key={pageId} className="truncate border-l-2 border-[var(--accent-primary)]/30 pl-2">
+                              {page.title}
+                            </li>
+                          ) : null;
+                        })}
+                        {pagesInProgress.size > 3 && (
+                          <li className="text-[var(--muted)]">
+                            {language === 'ja'
+                              ? `...他に${pagesInProgress.size - 3}ページ`
+                              : messages.repoPage?.andMorePages
+                                  ? messages.repoPage.andMorePages.replace('{count}', (pagesInProgress.size - 3).toString())
+                                  : `...and ${pagesInProgress.size - 3} more`}
+                          </li>
+                        )}
+                      </ul>
+                    </div>
+                  )}
+                  {failedPageEntries.length > 0 && (
+                    <div className="text-xs text-[var(--highlight)]">
+                      <p className="font-semibold mb-1">
+                        {messages.repoPage?.pageGenerationFailed || 'Some pages could not be generated automatically:'}
+                      </p>
+                      <ul className="space-y-1">
+                        {failedPageEntries.map(([pageId, status]) => {
+                          const page = wikiStructure.pages.find(p => p.id === pageId);
+                          return (
+                            <li
+                              key={pageId}
+                              className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 border-l-2 border-[var(--highlight)]/40 pl-2"
+                            >
+                              <span className="text-[var(--foreground)]">{page?.title || pageId}</span>
+                              {status.lastError && (
+                                <span className="text-[var(--muted)] sm:text-right">{status.lastError}</span>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            <div className="h-full overflow-y-auto flex flex-col lg:flex-row gap-4 w-full overflow-hidden bg-[var(--card-bg)] rounded-lg shadow-custom card-japanese">
             {/* Wiki Navigation */}
             <div className="h-full w-full lg:w-[280px] xl:w-[320px] flex-shrink-0 bg-[var(--background)]/50 rounded-lg rounded-r-none p-5 border-b lg:border-b-0 lg:border-r border-[var(--border-color)] overflow-y-auto">
               <h3 className="text-lg font-bold text-[var(--foreground)] mb-3 font-serif">{wikiStructure.title}</h3>
@@ -2166,6 +2408,7 @@ IMPORTANT:
               )}
             </div>
           </div>
+        </>
         ) : null}
       </main>
 
@@ -2179,7 +2422,7 @@ IMPORTANT:
       </footer>
 
       {/* Floating Chat Button */}
-      {!isLoading && wikiStructure && (
+      {wikiStructure && (!isLoading || generationInProgress) && (
         <button
           onClick={() => setIsAskModalOpen(true)}
           className="fixed bottom-6 right-6 w-14 h-14 rounded-full bg-[var(--accent-primary)] text-white shadow-lg flex items-center justify-center hover:bg-[var(--accent-primary)]/90 transition-all z-50"
