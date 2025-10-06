@@ -113,11 +113,14 @@
     "relatedPages": "Páginas Relacionadas:",
     "selectPagePrompt": "Seleccione una página de la navegación para ver su contenido",
     "askAboutRepo": "Hacer preguntas sobre este repositorio",
-    "generatingPages": "Generating wiki pages...",
-    "partialGenerationWarning": "Some pages could not be generated yet.",
-    "partialGenerationDescription": "You can retry generating the remaining pages. Failed pages will stay accessible with their current content until regeneration succeeds.",
-    "failedAttemptCount": "Attempts: {count}",
-    "retryFailedPages": "Retry failed pages"
+    "generatingPages": "Generando páginas del wiki...",
+    "pagesCompleted": "{completed} de {total} páginas completadas",
+    "currentlyProcessing": "Procesando actualmente:",
+    "andMorePages": "...y {count} más",
+    "partialGenerationWarning": "Algunas páginas aún no pudieron generarse.",
+    "partialGenerationDescription": "Puede volver a intentar generar las páginas restantes. Las páginas que fallen seguirán disponibles con su contenido actual hasta que la regeneración tenga éxito.",
+    "failedAttemptCount": "Intentos: {count}",
+    "retryFailedPages": "Reintentar páginas fallidas"
   },
   "nav": {
     "wikiProjects": "Lista de Proyectos"

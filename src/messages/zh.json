@@ -113,11 +113,14 @@
     "relatedPages": "相关页面：",
     "selectPagePrompt": "从导航中选择一个页面以查看其内容",
     "askAboutRepo": "询问关于此仓库的问题",
-    "generatingPages": "Generating wiki pages...",
-    "partialGenerationWarning": "Some pages could not be generated yet.",
-    "partialGenerationDescription": "You can retry generating the remaining pages. Failed pages will stay accessible with their current content until regeneration succeeds.",
-    "failedAttemptCount": "Attempts: {count}",
-    "retryFailedPages": "Retry failed pages"
+    "generatingPages": "正在生成 Wiki 页面...",
+    "pagesCompleted": "已完成 {completed}/{total} 个页面",
+    "currentlyProcessing": "当前正在处理：",
+    "andMorePages": "...以及另外 {count} 个",
+    "partialGenerationWarning": "部分页面尚未生成。",
+    "partialGenerationDescription": "您可以重试生成剩余页面。在重新生成成功之前，失败的页面仍将保持当前内容可访问。",
+    "failedAttemptCount": "尝试次数：{count}",
+    "retryFailedPages": "重试失败的页面"
   },
   "nav": {
     "wikiProjects": "项目列表"

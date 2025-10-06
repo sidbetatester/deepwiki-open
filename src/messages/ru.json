@@ -122,11 +122,14 @@
     "relatedPages": "Связанные страницы:",
     "selectPagePrompt": "Выберите страницу в навигации для просмотра её содержимого",
     "askAboutRepo": "Задайте вопросы об этом репозитории",
-    "generatingPages": "Generating wiki pages...",
-    "partialGenerationWarning": "Some pages could not be generated yet.",
-    "partialGenerationDescription": "You can retry generating the remaining pages. Failed pages will stay accessible with their current content until regeneration succeeds.",
-    "failedAttemptCount": "Attempts: {count}",
-    "retryFailedPages": "Retry failed pages"
+    "generatingPages": "Генерация страниц wiki...",
+    "pagesCompleted": "Завершено {completed} из {total} страниц",
+    "currentlyProcessing": "Сейчас обрабатывается:",
+    "andMorePages": "...и ещё {count}",
+    "partialGenerationWarning": "Некоторые страницы пока не удалось сгенерировать.",
+    "partialGenerationDescription": "Вы можете повторно попытаться сгенерировать оставшиеся страницы. Неудачные страницы останутся доступными с текущим содержимым до успешной регенерации.",
+    "failedAttemptCount": "Попыток: {count}",
+    "retryFailedPages": "Повторить попытку для неудачных страниц"
   },
   "nav": {
     "wikiProjects": "Проекты Wiki"
