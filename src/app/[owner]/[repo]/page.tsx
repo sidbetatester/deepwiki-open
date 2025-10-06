@@ -87,6 +87,71 @@ const wikiStyles = `
   }
 `;
 
+const MAX_PAGE_GENERATION_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 2000;
+const RETRY_MAX_DELAY_MS = 15000;
+
+interface RetryableError extends Error {
+  retryable?: boolean;
+}
+
+const createRetryableError = (message: string): RetryableError => {
+  const error = new Error(message) as RetryableError;
+  error.retryable = true;
+  return error;
+};
+
+const sleep = (ms: number) => new Promise<void>(resolve => {
+  setTimeout(resolve, ms);
+});
+
+const RETRYABLE_ERROR_PATTERNS = [
+  /timeout/i,
+  /network/i,
+  /disconnect/i,
+  /socket/i,
+  /failed to fetch/i,
+  /rate limit/i,
+  /429/,
+  /500/,
+  /502/,
+  /503/,
+  /504/
+];
+
+const isRetryableError = (error: unknown): boolean => {
+  if (!error) {
+    return false;
+  }
+
+  if (typeof error === 'object' && error !== null && 'retryable' in error) {
+    return Boolean((error as RetryableError).retryable);
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return RETRYABLE_ERROR_PATTERNS.some(pattern => pattern.test(message));
+};
+
+const decodeMessageData = async (data: MessageEvent['data']): Promise<string> => {
+  if (typeof data === 'string') {
+    return data;
+  }
+
+  if (data instanceof Blob) {
+    return data.text();
+  }
+
+  if (data instanceof ArrayBuffer) {
+    return new TextDecoder().decode(data);
+  }
+
+  if (ArrayBuffer.isView(data)) {
+    return new TextDecoder().decode(data.buffer);
+  }
+
+  return String(data ?? '');
+};
+
 // Helper function to generate cache key for localStorage
 const getCacheKey = (owner: string, repo: string, repoType: string, language: string, isComprehensive: boolean = true): string => {
   return `deepwiki_cache_${repoType}_${owner}_${repo}_${language}_${isComprehensive ? 'comprehensive' : 'concise'}`;
@@ -362,52 +427,57 @@ export default function RepoWikiPage() {
 
   // Generate content for a wiki page
   const generatePageContent = useCallback(async (page: WikiPage, owner: string, repo: string) => {
-    return new Promise<void>(async (resolve) => {
-      try {
-        // Skip if content already exists
-        if (generatedPages[page.id]?.content) {
-          resolve();
-          return;
-        }
+    const existingContent = generatedPages[page.id]?.content;
+    if (existingContent && existingContent !== 'Loading...' && !existingContent.startsWith('Error generating content')) {
+      return true;
+    }
 
-        // Skip if this page is already being processed
-        // Use a synchronized pattern to avoid race conditions
-        if (activeContentRequests.get(page.id)) {
-          console.log(`Page ${page.id} (${page.title}) is already being processed, skipping duplicate call`);
-          resolve();
-          return;
-        }
+    if (activeContentRequests.get(page.id)) {
+      console.log(`Page ${page.id} (${page.title}) is already being processed, skipping duplicate call`);
+      return true;
+    }
 
-        // Mark this page as being processed immediately to prevent race conditions
-        // This ensures that if multiple calls happen nearly simultaneously, only one proceeds
-        activeContentRequests.set(page.id, true);
+    if (!owner || !repo) {
+      const message = 'Invalid repository information. Owner and repo name are required.';
+      console.error(message);
+      setError(message);
+      return false;
+    }
 
-        // Validate repo info
-        if (!owner || !repo) {
-          throw new Error('Invalid repository information. Owner and repo name are required.');
-        }
+    activeContentRequests.set(page.id, true);
 
-        // Mark page as in progress
-        setPagesInProgress(prev => new Set(prev).add(page.id));
-        // Don't set loading message for individual pages during queue processing
+    setPagesInProgress(prev => {
+      const next = new Set(prev);
+      next.add(page.id);
+      return next;
+    });
 
-        const filePaths = page.filePaths;
+    const filePaths = page.filePaths;
 
-        // Store the initially generated content BEFORE rendering/potential modification
-        setGeneratedPages(prev => ({
+    const updatePageState = (content: string) => {
+      setGeneratedPages(prev => {
+        const previousPage = prev[page.id] ?? page;
+        return {
           ...prev,
-          [page.id]: { ...page, content: 'Loading...' } // Placeholder
-        }));
-        setOriginalMarkdown(prev => ({ ...prev, [page.id]: '' })); // Clear previous original
+          [page.id]: {
+            ...previousPage,
+            content,
+          },
+        };
+      });
+    };
 
-        // Make API call to generate page content
-        console.log(`Starting content generation for page: ${page.title}`);
+    if (!existingContent || existingContent === '' || existingContent === 'Loading...' || existingContent.startsWith('Error generating content')) {
+      updatePageState('Loading...');
+    }
 
-        // Get repository URL
-        const repoUrl = getRepoUrl(effectiveRepoInfo);
+    setOriginalMarkdown(prev => ({ ...prev, [page.id]: '' }));
 
-        // Create the prompt content - simplified to avoid message dialogs
- const promptContent =
+    console.log(`Starting content generation for page: ${page.title}`);
+
+    const repoUrl = getRepoUrl(effectiveRepoInfo);
+
+    const promptContent =
 `You are an expert technical writer and software architect.
 Your task is to generate a comprehensive and accurate technical wiki page in Markdown format about a specific feature, system, or module within a given software project.
 
@@ -487,7 +557,7 @@ IMPORTANT: Generate the content in ${language === 'en' ? 'English' :
             language === 'zh-tw' ? 'Traditional Chinese (繁體中文)' :
             language === 'es' ? 'Spanish (Español)' :
             language === 'kr' ? 'Korean (한국어)' :
-            language === 'vi' ? 'Vietnamese (Tiếng Việt)' : 
+            language === 'vi' ? 'Vietnamese (Tiếng Việt)' :
             language === "pt-br" ? "Brazilian Portuguese (Português Brasileiro)" :
             language === "fr" ? "Français (French)" :
             language === "ru" ? "Русский (Russian)" :
@@ -499,160 +569,219 @@ Remember:
 - Structure the document logically for easy understanding by other developers.
 `;
 
-        // Prepare request body
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const requestBody: Record<string, any> = {
-          repo_url: repoUrl,
-          type: effectiveRepoInfo.type,
-          messages: [{
-            role: 'user',
-            content: promptContent
-          }]
-        };
+    let attempt = 0;
+    let success = false;
 
-        // Add tokens if available
-        addTokensToRequestBody(requestBody, currentToken, effectiveRepoInfo.type, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles);
+    while (attempt < MAX_PAGE_GENERATION_RETRIES && !success) {
+      attempt += 1;
+      const attemptLabel = `${attempt}/${MAX_PAGE_GENERATION_RETRIES}`;
+      setLoadingMessage(`Generating "${page.title}" (attempt ${attemptLabel})...`);
 
-        // Use WebSocket for communication
-        let content = '';
+      if (attempt > 1) {
+        updatePageState(`Retrying generation for ${page.title} (attempt ${attemptLabel})...`);
+      }
 
-        try {
-          // Create WebSocket URL from the server base URL
+      try {
+        const generatedContent = await (async () => {
+          const requestBody: {
+            repo_url: string | undefined;
+            type: string;
+            messages: { role: string; content: string }[];
+            [key: string]: unknown;
+          } = {
+            repo_url: repoUrl,
+            type: effectiveRepoInfo.type,
+            messages: [{
+              role: 'user',
+              content: promptContent,
+            }],
+          };
+
+          addTokensToRequestBody(
+            requestBody,
+            currentToken,
+            effectiveRepoInfo.type,
+            selectedProviderState,
+            selectedModelState,
+            isCustomSelectedModelState,
+            customSelectedModelState,
+            language,
+            modelExcludedDirs,
+            modelExcludedFiles,
+            modelIncludedDirs,
+            modelIncludedFiles,
+          );
+
+          let aggregatedContent = '';
+
+          const pushChunk = (chunk: string) => {
+            if (!chunk) {
+              return;
+            }
+            aggregatedContent += chunk;
+            updatePageState(aggregatedContent);
+          };
+
           const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
-          const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws')? serverBaseUrl.replace(/^https/, 'wss'): serverBaseUrl.replace(/^http/, 'ws');
+          const wsBaseUrl = serverBaseUrl.startsWith('https')
+            ? serverBaseUrl.replace(/^https/, 'wss')
+            : serverBaseUrl.replace(/^http/, 'ws');
           const wsUrl = `${wsBaseUrl}/ws/chat`;
 
-          // Create a new WebSocket connection
-          const ws = new WebSocket(wsUrl);
+          const streamViaWebSocket = async () => {
+            const ws = new WebSocket(wsUrl);
 
-          // Create a promise that resolves when the WebSocket connection is complete
-          await new Promise<void>((resolve, reject) => {
-            // Set up event handlers
-            ws.onopen = () => {
-              console.log(`WebSocket connection established for page: ${page.title}`);
-              // Send the request as JSON
-              ws.send(JSON.stringify(requestBody));
-              resolve();
-            };
+            await new Promise<void>((resolve, reject) => {
+              const handleOpen = () => {
+                window.clearTimeout(timeoutId);
+                cleanup();
+                ws.send(JSON.stringify(requestBody));
+                resolve();
+              };
 
-            ws.onerror = (error) => {
-              console.error('WebSocket error:', error);
-              reject(new Error('WebSocket connection failed'));
-            };
+              const handleError = () => {
+                window.clearTimeout(timeoutId);
+                cleanup();
+                reject(createRetryableError('WebSocket connection failed'));
+              };
 
-            // If the connection doesn't open within 5 seconds, fall back to HTTP
-            const timeout = setTimeout(() => {
-              reject(new Error('WebSocket connection timeout'));
-            }, 5000);
+              const cleanup = () => {
+                ws.removeEventListener('open', handleOpen);
+                ws.removeEventListener('error', handleError);
+              };
 
-            // Clear the timeout if the connection opens successfully
-            ws.onopen = () => {
-              clearTimeout(timeout);
-              console.log(`WebSocket connection established for page: ${page.title}`);
-              // Send the request as JSON
-              ws.send(JSON.stringify(requestBody));
-              resolve();
-            };
-          });
+              const timeoutId = window.setTimeout(() => {
+                cleanup();
+                ws.close();
+                reject(createRetryableError('WebSocket connection timeout'));
+              }, 5000);
 
-          // Create a promise that resolves when the WebSocket response is complete
-          await new Promise<void>((resolve, reject) => {
-            // Handle incoming messages
-            ws.onmessage = (event) => {
-              content += event.data;
-            };
+              ws.addEventListener('open', handleOpen);
+              ws.addEventListener('error', handleError);
+            });
 
-            // Handle WebSocket close
-            ws.onclose = () => {
-              console.log(`WebSocket connection closed for page: ${page.title}`);
-              resolve();
-            };
+            await new Promise<void>((resolve, reject) => {
+              const handleMessage = (event: MessageEvent) => {
+                void decodeMessageData(event.data)
+                  .then(chunk => {
+                    pushChunk(chunk);
+                  })
+                  .catch(chunkError => {
+                    console.error('Failed to decode WebSocket chunk:', chunkError);
+                  });
+              };
 
-            // Handle WebSocket errors
-            ws.onerror = (error) => {
-              console.error('WebSocket error during message reception:', error);
-              reject(new Error('WebSocket error during message reception'));
-            };
-          });
-        } catch (wsError) {
-          console.error('WebSocket error, falling back to HTTP:', wsError);
+              const handleClose = () => {
+                cleanup();
+                resolve();
+              };
 
-          // Fall back to HTTP if WebSocket fails
-          const response = await fetch(`/api/chat/stream`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestBody)
-          });
+              const handleStreamError = () => {
+                cleanup();
+                reject(createRetryableError('WebSocket error during message reception'));
+              };
 
-          if (!response.ok) {
-            const errorText = await response.text().catch(() => 'No error details available');
-            console.error(`API error (${response.status}): ${errorText}`);
-            throw new Error(`Error generating page content: ${response.status} - ${response.statusText}`);
-          }
+              const cleanup = () => {
+                ws.removeEventListener('message', handleMessage);
+                ws.removeEventListener('close', handleClose);
+                ws.removeEventListener('error', handleStreamError);
+              };
 
-          // Process the response
-          content = '';
-          const reader = response.body?.getReader();
-          const decoder = new TextDecoder();
+              ws.addEventListener('message', handleMessage);
+              ws.addEventListener('close', handleClose);
+              ws.addEventListener('error', handleStreamError);
+            });
 
-          if (!reader) {
-            throw new Error('Failed to get response reader');
-          }
+            ws.close();
+          };
 
           try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              content += decoder.decode(value, { stream: true });
+            await streamViaWebSocket();
+          } catch (wsError) {
+            console.error('WebSocket error, falling back to HTTP:', wsError);
+            updatePageState('WebSocket transport unavailable. Switching to HTTP streaming...');
+            aggregatedContent = '';
+
+            const response = await fetch(`/api/chat/stream`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(requestBody),
+            });
+
+            if (!response.ok) {
+              const errorText = await response.text().catch(() => 'No error details available');
+              console.error(`API error (${response.status}): ${errorText}`);
+              const httpError = new Error(`Error generating page content: ${response.status} - ${response.statusText}`) as RetryableError;
+              if (response.status >= 500 || response.status === 429) {
+                httpError.retryable = true;
+              }
+              throw httpError;
             }
-            // Ensure final decoding
-            content += decoder.decode();
-          } catch (readError) {
-            console.error('Error reading stream:', readError);
-            throw new Error('Error processing response stream');
+
+            const reader = response.body?.getReader();
+            const decoder = new TextDecoder();
+
+            if (!reader) {
+              throw createRetryableError('Failed to get response reader');
+            }
+
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value) {
+                  const chunk = decoder.decode(value, { stream: true });
+                  pushChunk(chunk);
+                }
+              }
+              const remaining = decoder.decode();
+              if (remaining) {
+                pushChunk(remaining);
+              }
+            } catch (readError) {
+              console.error('Error reading stream:', readError);
+              throw createRetryableError('Error processing response stream');
+            }
           }
+
+          const sanitized = aggregatedContent.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
+          return sanitized;
+        })();
+
+        console.log(`Received content for ${page.title}, length: ${generatedContent.length} characters`);
+        updatePageState(generatedContent);
+        setOriginalMarkdown(prev => ({ ...prev, [page.id]: generatedContent }));
+        success = true;
+      } catch (attemptError) {
+        console.error(`Error generating content for page ${page.id} (attempt ${attempt}):`, attemptError);
+
+        if (attempt < MAX_PAGE_GENERATION_RETRIES && isRetryableError(attemptError)) {
+          const backoff = Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
+          updatePageState(`Encountered an error while generating this page. Retrying in ${Math.round(backoff / 1000)}s (attempt ${attempt + 1}/${MAX_PAGE_GENERATION_RETRIES})...`);
+          await sleep(backoff);
+          continue;
         }
 
-        // Clean up markdown delimiters
-        content = content.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
-
-        console.log(`Received content for ${page.title}, length: ${content.length} characters`);
-
-        // Store the FINAL generated content
-        const updatedPage = { ...page, content };
-        setGeneratedPages(prev => ({ ...prev, [page.id]: updatedPage }));
-        // Store this as the original for potential mermaid retries
-        setOriginalMarkdown(prev => ({ ...prev, [page.id]: content }));
-
-        resolve();
-      } catch (err) {
-        console.error(`Error generating content for page ${page.id}:`, err);
-        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-        // Update page state to show error
-        setGeneratedPages(prev => ({
-          ...prev,
-          [page.id]: { ...page, content: `Error generating content: ${errorMessage}` }
-        }));
-        setError(`Failed to generate content for ${page.title}.`);
-        resolve(); // Resolve even on error to unblock queue
-      } finally {
-        // Clear the processing flag for this page
-        // This must happen in the finally block to ensure the flag is cleared
-        // even if an error occurs during processing
-        activeContentRequests.delete(page.id);
-
-        // Mark page as done
-        setPagesInProgress(prev => {
-          const next = new Set(prev);
-          next.delete(page.id);
-          return next;
-        });
-        setLoadingMessage(undefined); // Clear specific loading message
+        const message = attemptError instanceof Error ? attemptError.message : 'Unknown error';
+        updatePageState(`Error generating content: ${message}`);
+        setError(`Failed to generate content for ${page.title}. ${message}`);
       }
+    }
+
+    activeContentRequests.delete(page.id);
+    setPagesInProgress(prev => {
+      const next = new Set(prev);
+      next.delete(page.id);
+      if (next.size === 0) {
+        setLoadingMessage(undefined);
+      }
+      return next;
     });
-  }, [generatedPages, currentToken, effectiveRepoInfo, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, language, activeContentRequests, generateFileUrl]);
+
+    return success;
+  }, [generatedPages, activeContentRequests, currentToken, effectiveRepoInfo, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, generateFileUrl]);
 
   // Determine the wiki structure from repository data
   const determineWikiStructure = useCallback(async (fileTree: string, readme: string, owner: string, repo: string) => {
@@ -1135,7 +1264,7 @@ IMPORTANT:
     } finally {
       setStructureRequestInProgress(false);
     }
-  }, [generatePageContent, currentToken, effectiveRepoInfo, pagesInProgress.size, structureRequestInProgress, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, language, messages.loading, isComprehensiveView]);
+  }, [generatePageContent, currentToken, effectiveRepoInfo, pagesInProgress.size, structureRequestInProgress, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, language, messages.loading, isComprehensiveView]);
 
   // Fetch repository structure using GitHub or GitLab API
   const fetchRepositoryStructure = useCallback(async () => {
@@ -1902,7 +2031,7 @@ IMPORTANT:
     };
 
     saveCache();
-  }, [isLoading, error, wikiStructure, generatedPages, effectiveRepoInfo.owner, effectiveRepoInfo.repo, effectiveRepoInfo.type, effectiveRepoInfo.repoUrl, repoUrl, language, isComprehensiveView]);
+  }, [isLoading, error, wikiStructure, generatedPages, effectiveRepoInfo, effectiveRepoInfo.owner, effectiveRepoInfo.repo, effectiveRepoInfo.type, effectiveRepoInfo.repoUrl, repoUrl, language, isComprehensiveView, selectedProviderState, selectedModelState]);
 
   const handlePageSelect = (pageId: string) => {
     if (currentPageId != pageId) {
