@@ -87,6 +87,12 @@ const wikiStyles = `
   }
 `;
 
+const MAX_PAGE_GENERATION_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1500;
+const RETRY_MAX_DELAY_MS = 8000;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Helper function to generate cache key for localStorage
 const getCacheKey = (owner: string, repo: string, repoType: string, language: string, isComprehensive: boolean = true): string => {
   return `deepwiki_cache_${repoType}_${owner}_${repo}_${language}_${isComprehensive ? 'comprehensive' : 'concise'}`;
@@ -230,6 +236,7 @@ export default function RepoWikiPage() {
   const [currentToken, setCurrentToken] = useState(token); // Track current effective token
   const [effectiveRepoInfo, setEffectiveRepoInfo] = useState(repoInfo); // Track effective repo info with cached data
   const [embeddingError, setEmbeddingError] = useState(false);
+  const [failedPages, setFailedPages] = useState<Record<string, number>>({});
 
   // Model selection state variables
   const [selectedProviderState, setSelectedProviderState] = useState(providerParam);
@@ -362,52 +369,41 @@ export default function RepoWikiPage() {
 
   // Generate content for a wiki page
   const generatePageContent = useCallback(async (page: WikiPage, owner: string, repo: string) => {
-    return new Promise<void>(async (resolve) => {
-      try {
-        // Skip if content already exists
-        if (generatedPages[page.id]?.content) {
-          resolve();
-          return;
-        }
+    let success = false;
+    let lastErrorMessage = '';
 
-        // Skip if this page is already being processed
-        // Use a synchronized pattern to avoid race conditions
-        if (activeContentRequests.get(page.id)) {
-          console.log(`Page ${page.id} (${page.title}) is already being processed, skipping duplicate call`);
-          resolve();
-          return;
-        }
+    try {
+      const existingPage = generatedPages[page.id];
+      if (existingPage?.content && existingPage.content !== 'Loading...' && !(page.id in failedPages)) {
+        return;
+      }
 
-        // Mark this page as being processed immediately to prevent race conditions
-        // This ensures that if multiple calls happen nearly simultaneously, only one proceeds
-        activeContentRequests.set(page.id, true);
+      if (activeContentRequests.get(page.id)) {
+        console.log(`Page ${page.id} (${page.title}) is already being processed, skipping duplicate call`);
+        return;
+      }
 
-        // Validate repo info
-        if (!owner || !repo) {
-          throw new Error('Invalid repository information. Owner and repo name are required.');
-        }
+      activeContentRequests.set(page.id, true);
 
-        // Mark page as in progress
-        setPagesInProgress(prev => new Set(prev).add(page.id));
-        // Don't set loading message for individual pages during queue processing
+      if (!owner || !repo) {
+        throw new Error('Invalid repository information. Owner and repo name are required.');
+      }
 
-        const filePaths = page.filePaths;
+      setPagesInProgress(prev => new Set(prev).add(page.id));
 
-        // Store the initially generated content BEFORE rendering/potential modification
-        setGeneratedPages(prev => ({
-          ...prev,
-          [page.id]: { ...page, content: 'Loading...' } // Placeholder
-        }));
-        setOriginalMarkdown(prev => ({ ...prev, [page.id]: '' })); // Clear previous original
+      const filePaths = page.filePaths;
 
-        // Make API call to generate page content
-        console.log(`Starting content generation for page: ${page.title}`);
+      setGeneratedPages(prev => ({
+        ...prev,
+        [page.id]: { ...page, content: 'Loading...' }
+      }));
+      setOriginalMarkdown(prev => ({ ...prev, [page.id]: '' }));
 
-        // Get repository URL
-        const repoUrl = getRepoUrl(effectiveRepoInfo);
+      console.log(`Starting content generation for page: ${page.title}`);
 
-        // Create the prompt content - simplified to avoid message dialogs
- const promptContent =
+      const repoUrl = getRepoUrl(effectiveRepoInfo);
+
+      const promptContent =
 `You are an expert technical writer and software architect.
 Your task is to generate a comprehensive and accurate technical wiki page in Markdown format about a specific feature, system, or module within a given software project.
 
@@ -487,7 +483,7 @@ IMPORTANT: Generate the content in ${language === 'en' ? 'English' :
             language === 'zh-tw' ? 'Traditional Chinese (繁體中文)' :
             language === 'es' ? 'Spanish (Español)' :
             language === 'kr' ? 'Korean (한국어)' :
-            language === 'vi' ? 'Vietnamese (Tiếng Việt)' : 
+            language === 'vi' ? 'Vietnamese (Tiếng Việt)' :
             language === "pt-br" ? "Brazilian Portuguese (Português Brasileiro)" :
             language === "fr" ? "Français (French)" :
             language === "ru" ? "Русский (Russian)" :
@@ -496,88 +492,91 @@ IMPORTANT: Generate the content in ${language === 'en' ? 'English' :
 Remember:
 - Ground every claim in the provided source files.
 - Prioritize accuracy and direct representation of the code's functionality and structure.
-- Structure the document logically for easy understanding by other developers.
-`;
+- Structure the document logically for easy understanding by other developers.`;
 
-        // Prepare request body
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const requestBody: Record<string, any> = {
-          repo_url: repoUrl,
-          type: effectiveRepoInfo.type,
-          messages: [{
-            role: 'user',
-            content: promptContent
-          }]
-        };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const requestBody: Record<string, any> = {
+        repo_url: repoUrl,
+        type: effectiveRepoInfo.type,
+        messages: [{
+          role: 'user',
+          content: promptContent
+        }]
+      };
 
-        // Add tokens if available
-        addTokensToRequestBody(requestBody, currentToken, effectiveRepoInfo.type, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles);
+      addTokensToRequestBody(
+        requestBody,
+        currentToken,
+        effectiveRepoInfo.type,
+        selectedProviderState,
+        selectedModelState,
+        isCustomSelectedModelState,
+        customSelectedModelState,
+        language,
+        modelExcludedDirs,
+        modelExcludedFiles,
+        modelIncludedDirs,
+        modelIncludedFiles
+      );
 
-        // Use WebSocket for communication
+      const fetchContent = async (): Promise<string> => {
         let content = '';
 
         try {
-          // Create WebSocket URL from the server base URL
           const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
-          const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws')? serverBaseUrl.replace(/^https/, 'wss'): serverBaseUrl.replace(/^http/, 'ws');
+          const wsBaseUrl = serverBaseUrl.startsWith('https')
+            ? serverBaseUrl.replace(/^https/, 'wss')
+            : serverBaseUrl.replace(/^http/, 'ws');
           const wsUrl = `${wsBaseUrl}/ws/chat`;
 
-          // Create a new WebSocket connection
           const ws = new WebSocket(wsUrl);
 
-          // Create a promise that resolves when the WebSocket connection is complete
           await new Promise<void>((resolve, reject) => {
-            // Set up event handlers
+            const timeout = setTimeout(() => {
+              ws.close();
+              reject(new Error('WebSocket connection timeout'));
+            }, 5000);
+
             ws.onopen = () => {
+              clearTimeout(timeout);
               console.log(`WebSocket connection established for page: ${page.title}`);
-              // Send the request as JSON
               ws.send(JSON.stringify(requestBody));
               resolve();
             };
 
             ws.onerror = (error) => {
+              clearTimeout(timeout);
+              ws.close();
               console.error('WebSocket error:', error);
               reject(new Error('WebSocket connection failed'));
             };
-
-            // If the connection doesn't open within 5 seconds, fall back to HTTP
-            const timeout = setTimeout(() => {
-              reject(new Error('WebSocket connection timeout'));
-            }, 5000);
-
-            // Clear the timeout if the connection opens successfully
-            ws.onopen = () => {
-              clearTimeout(timeout);
-              console.log(`WebSocket connection established for page: ${page.title}`);
-              // Send the request as JSON
-              ws.send(JSON.stringify(requestBody));
-              resolve();
-            };
           });
 
-          // Create a promise that resolves when the WebSocket response is complete
           await new Promise<void>((resolve, reject) => {
-            // Handle incoming messages
             ws.onmessage = (event) => {
               content += event.data;
             };
 
-            // Handle WebSocket close
             ws.onclose = () => {
               console.log(`WebSocket connection closed for page: ${page.title}`);
               resolve();
             };
 
-            // Handle WebSocket errors
             ws.onerror = (error) => {
               console.error('WebSocket error during message reception:', error);
+              ws.close();
               reject(new Error('WebSocket error during message reception'));
             };
           });
+
+          if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+            ws.close();
+          }
+
+          return content;
         } catch (wsError) {
           console.error('WebSocket error, falling back to HTTP:', wsError);
 
-          // Fall back to HTTP if WebSocket fails
           const response = await fetch(`/api/chat/stream`, {
             method: 'POST',
             headers: {
@@ -592,8 +591,6 @@ Remember:
             throw new Error(`Error generating page content: ${response.status} - ${response.statusText}`);
           }
 
-          // Process the response
-          content = '';
           const reader = response.body?.getReader();
           const decoder = new TextDecoder();
 
@@ -601,59 +598,97 @@ Remember:
             throw new Error('Failed to get response reader');
           }
 
+          content = '';
           try {
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
               content += decoder.decode(value, { stream: true });
             }
-            // Ensure final decoding
             content += decoder.decode();
           } catch (readError) {
             console.error('Error reading stream:', readError);
             throw new Error('Error processing response stream');
           }
+
+          return content;
+        }
+      };
+
+      let attempt = 1;
+      while (attempt <= MAX_PAGE_GENERATION_RETRIES && !success) {
+        try {
+          if (attempt > 1) {
+            setGeneratedPages(prev => ({
+              ...prev,
+              [page.id]: {
+                ...page,
+                content: `Attempt ${attempt - 1} failed: ${lastErrorMessage || 'Unknown error'}. Retrying...`
+              }
+            }));
+          }
+
+          let content = await fetchContent();
+          content = content.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
+
+          console.log(`Received content for ${page.title}, length: ${content.length} characters`);
+
+          const updatedPage = { ...page, content };
+          setGeneratedPages(prev => ({ ...prev, [page.id]: updatedPage }));
+          setOriginalMarkdown(prev => ({ ...prev, [page.id]: content }));
+          setFailedPages(prev => {
+            if (!(page.id in prev)) {
+              return prev;
+            }
+            const next = { ...prev };
+            delete next[page.id];
+            return next;
+          });
+          success = true;
+        } catch (err) {
+          lastErrorMessage = err instanceof Error ? err.message : 'Unknown error';
+          console.error(`Error generating content for page ${page.id} (attempt ${attempt}):`, err);
+
+          if (attempt < MAX_PAGE_GENERATION_RETRIES) {
+            const delayMs = Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
+            const delaySeconds = (delayMs / 1000).toFixed(delayMs >= 1000 ? 1 : 0);
+            setGeneratedPages(prev => ({
+              ...prev,
+              [page.id]: {
+                ...page,
+                content: `Attempt ${attempt} failed: ${lastErrorMessage}. Retrying in ${delaySeconds}s...`
+              }
+            }));
+            await sleep(delayMs);
+          } else {
+            setGeneratedPages(prev => ({
+              ...prev,
+              [page.id]: {
+                ...page,
+                content: `Error generating content after ${MAX_PAGE_GENERATION_RETRIES} attempts: ${lastErrorMessage}`
+              }
+            }));
+            setFailedPages(prev => ({ ...prev, [page.id]: attempt }));
+          }
         }
 
-        // Clean up markdown delimiters
-        content = content.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
-
-        console.log(`Received content for ${page.title}, length: ${content.length} characters`);
-
-        // Store the FINAL generated content
-        const updatedPage = { ...page, content };
-        setGeneratedPages(prev => ({ ...prev, [page.id]: updatedPage }));
-        // Store this as the original for potential mermaid retries
-        setOriginalMarkdown(prev => ({ ...prev, [page.id]: content }));
-
-        resolve();
-      } catch (err) {
-        console.error(`Error generating content for page ${page.id}:`, err);
-        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-        // Update page state to show error
-        setGeneratedPages(prev => ({
-          ...prev,
-          [page.id]: { ...page, content: `Error generating content: ${errorMessage}` }
-        }));
-        setError(`Failed to generate content for ${page.title}.`);
-        resolve(); // Resolve even on error to unblock queue
-      } finally {
-        // Clear the processing flag for this page
-        // This must happen in the finally block to ensure the flag is cleared
-        // even if an error occurs during processing
-        activeContentRequests.delete(page.id);
-
-        // Mark page as done
-        setPagesInProgress(prev => {
-          const next = new Set(prev);
-          next.delete(page.id);
-          return next;
-        });
-        setLoadingMessage(undefined); // Clear specific loading message
+        attempt++;
       }
-    });
-  }, [generatedPages, currentToken, effectiveRepoInfo, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, language, activeContentRequests, generateFileUrl]);
 
+      if (!success && lastErrorMessage) {
+        console.warn(`Page ${page.title} could not be generated after ${MAX_PAGE_GENERATION_RETRIES} attempts.`);
+      }
+    } finally {
+      activeContentRequests.delete(page.id);
+
+      setPagesInProgress(prev => {
+        const next = new Set(prev);
+        next.delete(page.id);
+        return next;
+      });
+      setLoadingMessage(undefined);
+    }
+  }, [generatedPages, failedPages, currentToken, effectiveRepoInfo, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, language, activeContentRequests, generateFileUrl]);
   // Determine the wiki structure from repository data
   const determineWikiStructure = useCallback(async (fileTree: string, readme: string, owner: string, repo: string) => {
     if (!owner || !repo) {
@@ -1135,7 +1170,7 @@ IMPORTANT:
     } finally {
       setStructureRequestInProgress(false);
     }
-  }, [generatePageContent, currentToken, effectiveRepoInfo, pagesInProgress.size, structureRequestInProgress, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, language, messages.loading, isComprehensiveView]);
+  }, [generatePageContent, currentToken, effectiveRepoInfo, pagesInProgress.size, structureRequestInProgress, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, language, messages.loading, isComprehensiveView]);
 
   // Fetch repository structure using GitHub or GitLab API
   const fetchRepositoryStructure = useCallback(async () => {
@@ -1150,6 +1185,7 @@ IMPORTANT:
     setCurrentPageId(undefined);
     setGeneratedPages({});
     setPagesInProgress(new Set());
+    setFailedPages({});
     setError(null);
     setEmbeddingError(false); // Reset embedding error state
 
@@ -1855,6 +1891,7 @@ IMPORTANT:
       if (!isLoading &&
           !error &&
           wikiStructure &&
+          Object.keys(failedPages).length === 0 &&
           Object.keys(generatedPages).length > 0 &&
           Object.keys(generatedPages).length >= wikiStructure.pages.length &&
           !cacheLoadedSuccessfully.current) {
@@ -1902,13 +1939,48 @@ IMPORTANT:
     };
 
     saveCache();
-  }, [isLoading, error, wikiStructure, generatedPages, effectiveRepoInfo.owner, effectiveRepoInfo.repo, effectiveRepoInfo.type, effectiveRepoInfo.repoUrl, repoUrl, language, isComprehensiveView]);
+  }, [isLoading, error, wikiStructure, generatedPages, failedPages, effectiveRepoInfo, effectiveRepoInfo.owner, effectiveRepoInfo.repo, effectiveRepoInfo.type, effectiveRepoInfo.repoUrl, repoUrl, language, isComprehensiveView, selectedProviderState, selectedModelState]);
+
+  useEffect(() => {
+    if (
+      wikiStructure &&
+      pagesInProgress.size === 0 &&
+      !requestInProgress &&
+      !structureRequestInProgress
+    ) {
+      setIsLoading(false);
+      setLoadingMessage(undefined);
+    }
+  }, [wikiStructure, pagesInProgress, requestInProgress, structureRequestInProgress]);
 
   const handlePageSelect = (pageId: string) => {
     if (currentPageId != pageId) {
       setCurrentPageId(pageId)
     }
   };
+
+  const retryFailedPages = useCallback(() => {
+    if (!wikiStructure) {
+      return;
+    }
+
+    const failedIds = Object.keys(failedPages);
+    if (failedIds.length === 0) {
+      return;
+    }
+
+    setIsLoading(true);
+    setLoadingMessage(messages.loading?.retryingPages || 'Retrying failed pages...');
+
+    failedIds.forEach(pageId => {
+      const pageToRetry = wikiStructure.pages.find(p => p.id === pageId);
+      if (pageToRetry) {
+        generatePageContent(pageToRetry, owner, repo).catch(err => {
+          console.error(`Error retrying page ${pageId}:`, err);
+        });
+      }
+    });
+  }, [wikiStructure, failedPages, messages.loading, generatePageContent, owner, repo]);
 
   const [isModelSelectionModalOpen, setIsModelSelectionModalOpen] = useState(false);
 
@@ -1927,69 +1999,7 @@ IMPORTANT:
       </header>
 
       <main className="flex-1 max-w-[90%] xl:max-w-[1400px] mx-auto overflow-y-auto">
-        {isLoading ? (
-          <div className="flex flex-col items-center justify-center p-8 bg-[var(--card-bg)] rounded-lg shadow-custom card-japanese">
-            <div className="relative mb-6">
-              <div className="absolute -inset-4 bg-[var(--accent-primary)]/10 rounded-full blur-md animate-pulse"></div>
-              <div className="relative flex items-center justify-center">
-                <div className="w-3 h-3 bg-[var(--accent-primary)]/70 rounded-full animate-pulse"></div>
-                <div className="w-3 h-3 bg-[var(--accent-primary)]/70 rounded-full animate-pulse delay-75 mx-2"></div>
-                <div className="w-3 h-3 bg-[var(--accent-primary)]/70 rounded-full animate-pulse delay-150"></div>
-              </div>
-            </div>
-            <p className="text-[var(--foreground)] text-center mb-3 font-serif">
-              {loadingMessage || messages.common?.loading || 'Loading...'}
-              {isExporting && (messages.loading?.preparingDownload || ' Please wait while we prepare your download...')}
-            </p>
-
-            {/* Progress bar for page generation */}
-            {wikiStructure && (
-              <div className="w-full max-w-md mt-3">
-                <div className="bg-[var(--background)]/50 rounded-full h-2 mb-3 overflow-hidden border border-[var(--border-color)]">
-                  <div
-                    className="bg-[var(--accent-primary)] h-2 rounded-full transition-all duration-300 ease-in-out"
-                    style={{
-                      width: `${Math.max(5, 100 * (wikiStructure.pages.length - pagesInProgress.size) / wikiStructure.pages.length)}%`
-                    }}
-                  />
-                </div>
-                <p className="text-xs text-[var(--muted)] text-center">
-                  {language === 'ja'
-                    ? `${wikiStructure.pages.length}ページ中${wikiStructure.pages.length - pagesInProgress.size}ページ完了`
-                    : messages.repoPage?.pagesCompleted
-                        ? messages.repoPage.pagesCompleted
-                            .replace('{completed}', (wikiStructure.pages.length - pagesInProgress.size).toString())
-                            .replace('{total}', wikiStructure.pages.length.toString())
-                        : `${wikiStructure.pages.length - pagesInProgress.size} of ${wikiStructure.pages.length} pages completed`}
-                </p>
-
-                {/* Show list of in-progress pages */}
-                {pagesInProgress.size > 0 && (
-                  <div className="mt-4 text-xs">
-                    <p className="text-[var(--muted)] mb-2">
-                      {messages.repoPage?.currentlyProcessing || 'Currently processing:'}
-                    </p>
-                    <ul className="text-[var(--foreground)] space-y-1">
-                      {Array.from(pagesInProgress).slice(0, 3).map(pageId => {
-                        const page = wikiStructure.pages.find(p => p.id === pageId);
-                        return page ? <li key={pageId} className="truncate border-l-2 border-[var(--accent-primary)]/30 pl-2">{page.title}</li> : null;
-                      })}
-                      {pagesInProgress.size > 3 && (
-                        <li className="text-[var(--muted)]">
-                          {language === 'ja'
-                            ? `...他に${pagesInProgress.size - 3}ページ`
-                            : messages.repoPage?.andMorePages
-                                ? messages.repoPage.andMorePages.replace('{count}', (pagesInProgress.size - 3).toString())
-                                : `...and ${pagesInProgress.size - 3} more`}
-                        </li>
-                      )}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        ) : error ? (
+        {error ? (
           <div className="bg-[var(--highlight)]/5 border border-[var(--highlight)]/30 rounded-lg p-5 mb-4 shadow-sm">
             <div className="flex items-center text-[var(--highlight)] mb-3">
               <FaExclamationTriangle className="mr-2" />
@@ -2014,161 +2024,259 @@ IMPORTANT:
             </div>
           </div>
         ) : wikiStructure ? (
-          <div className="h-full overflow-y-auto flex flex-col lg:flex-row gap-4 w-full overflow-hidden bg-[var(--card-bg)] rounded-lg shadow-custom card-japanese">
-            {/* Wiki Navigation */}
-            <div className="h-full w-full lg:w-[280px] xl:w-[320px] flex-shrink-0 bg-[var(--background)]/50 rounded-lg rounded-r-none p-5 border-b lg:border-b-0 lg:border-r border-[var(--border-color)] overflow-y-auto">
-              <h3 className="text-lg font-bold text-[var(--foreground)] mb-3 font-serif">{wikiStructure.title}</h3>
-              <p className="text-[var(--muted)] text-sm mb-5 leading-relaxed">{wikiStructure.description}</p>
-
-              {/* Display repository info */}
-              <div className="text-xs text-[var(--muted)] mb-5 flex items-center">
-                {effectiveRepoInfo.type === 'local' ? (
-                  <div className="flex items-center">
-                    <FaFolder className="mr-2" />
-                    <span className="break-all">{effectiveRepoInfo.localPath}</span>
-                  </div>
-                ) : (
-                  <>
-                    {effectiveRepoInfo.type === 'github' ? (
-                      <FaGithub className="mr-2" />
-                    ) : effectiveRepoInfo.type === 'gitlab' ? (
-                      <FaGitlab className="mr-2" />
-                    ) : (
-                      <FaBitbucket className="mr-2" />
+          <div className="flex flex-col gap-4">
+            {(isLoading || pagesInProgress.size > 0) && (
+              <div className="bg-[var(--card-bg)] border border-[var(--border-color)] rounded-lg p-5 shadow-sm">
+                <p className="text-sm text-[var(--foreground)] font-serif mb-3">
+                  {loadingMessage || messages.repoPage?.generatingPages || 'Generating wiki pages...'}
+                  {isExporting && (messages.loading?.preparingDownload || ' Please wait while we prepare your download...')}
+                </p>
+                {wikiStructure.pages.length > 0 && (
+                  <div className="w-full max-w-xl">
+                    <div className="bg-[var(--background)]/50 rounded-full h-2 mb-3 overflow-hidden border border-[var(--border-color)]">
+                      <div
+                        className="bg-[var(--accent-primary)] h-2 rounded-full transition-all duration-300 ease-in-out"
+                        style={{
+                          width: `${Math.max(5, 100 * (wikiStructure.pages.length - pagesInProgress.size) / wikiStructure.pages.length)}%`
+                        }}
+                      />
+                    </div>
+                    <p className="text-xs text-[var(--muted)] text-center">
+                      {language === 'ja'
+                        ? `${wikiStructure.pages.length}ページ中${wikiStructure.pages.length - pagesInProgress.size}ページ完了`
+                        : messages.repoPage?.pagesCompleted
+                            ? messages.repoPage.pagesCompleted
+                                .replace('{completed}', (wikiStructure.pages.length - pagesInProgress.size).toString())
+                                .replace('{total}', wikiStructure.pages.length.toString())
+                            : `${wikiStructure.pages.length - pagesInProgress.size} of ${wikiStructure.pages.length} pages completed`}
+                    </p>
+                    {pagesInProgress.size > 0 && (
+                      <div className="mt-4 text-xs">
+                        <p className="text-[var(--muted)] mb-2">
+                          {messages.repoPage?.currentlyProcessing || 'Currently processing:'}
+                        </p>
+                        <ul className="text-[var(--foreground)] space-y-1">
+                          {Array.from(pagesInProgress).slice(0, 3).map(pageId => {
+                            const page = wikiStructure.pages.find(p => p.id === pageId);
+                            return page ? <li key={pageId} className="truncate border-l-2 border-[var(--accent-primary)]/30 pl-2">{page.title}</li> : null;
+                          })}
+                          {pagesInProgress.size > 3 && (
+                            <li className="text-[var(--muted)]">
+                              {language === 'ja'
+                                ? `...他に${pagesInProgress.size - 3}ページ`
+                                : messages.repoPage?.andMorePages
+                                    ? messages.repoPage.andMorePages.replace('{count}', (pagesInProgress.size - 3).toString())
+                                    : `...and ${pagesInProgress.size - 3} more`}
+                            </li>
+                          )}
+                        </ul>
+                      </div>
                     )}
-                    <a
-                      href={effectiveRepoInfo.repoUrl ?? ''}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="hover:text-[var(--accent-primary)] transition-colors border-b border-[var(--border-color)] hover:border-[var(--accent-primary)]"
-                    >
-                      {effectiveRepoInfo.owner}/{effectiveRepoInfo.repo}
-                    </a>
-                  </>
+                  </div>
                 )}
               </div>
+            )}
 
-              {/* Wiki Type Indicator */}
-              <div className="mb-3 flex items-center text-xs text-[var(--muted)]">
-                <span className="mr-2">Wiki Type:</span>
-                <span className={`px-2 py-0.5 rounded-full ${isComprehensiveView
-                  ? 'bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] border border-[var(--accent-primary)]/30'
-                  : 'bg-[var(--background)] text-[var(--foreground)] border border-[var(--border-color)]'}`}>
-                  {isComprehensiveView
-                    ? (messages.form?.comprehensive || 'Comprehensive')
-                    : (messages.form?.concise || 'Concise')}
-                </span>
+            {Object.keys(failedPages).length > 0 && (
+              <div className="bg-[var(--highlight)]/10 border border-[var(--highlight)]/30 rounded-lg p-5 shadow-sm">
+                <div className="flex items-start gap-3">
+                  <FaExclamationTriangle className="text-[var(--highlight)] mt-0.5" />
+                  <div className="flex-1">
+                    <h4 className="text-sm font-semibold text-[var(--highlight)] font-serif mb-1">
+                      {messages.repoPage?.partialGenerationWarning || 'Some pages could not be generated yet.'}
+                    </h4>
+                    <p className="text-xs text-[var(--muted)] mb-3">
+                      {messages.repoPage?.partialGenerationDescription || 'You can retry generating the remaining pages. Failed pages will stay accessible with their current content until regeneration succeeds.'}
+                    </p>
+                    <ul className="space-y-2 mb-4">
+                      {Object.entries(failedPages).map(([pageId, attempts]) => {
+                        const failedPage = wikiStructure.pages.find(p => p.id === pageId);
+                        return (
+                          <li key={pageId} className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 text-sm">
+                            <span className="text-[var(--foreground)] font-medium">{failedPage?.title || pageId}</span>
+                            <span className="text-[var(--muted)] text-xs">
+                              {messages.repoPage?.failedAttemptCount
+                                ? messages.repoPage.failedAttemptCount.replace('{count}', attempts.toString())
+                                : `Attempts: ${attempts}`}
+                            </span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    <button
+                      onClick={retryFailedPages}
+                      disabled={pagesInProgress.size > 0}
+                      className="btn-japanese px-4 py-2 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {messages.repoPage?.retryFailedPages || 'Retry failed pages'}
+                    </button>
+                  </div>
+                </div>
               </div>
+            )}
 
-              {/* Refresh Wiki button */}
-              <div className="mb-5">
-                <button
-                  onClick={() => setIsModelSelectionModalOpen(true)}
-                  disabled={isLoading}
-                  className="flex items-center w-full text-xs px-3 py-2 bg-[var(--background)] text-[var(--foreground)] rounded-md hover:bg-[var(--background)]/80 disabled:opacity-50 disabled:cursor-not-allowed border border-[var(--border-color)] transition-colors hover:cursor-pointer"
-                >
-                  <FaSync className={`mr-2 ${isLoading ? 'animate-spin' : ''}`} />
-                  {messages.repoPage?.refreshWiki || 'Refresh Wiki'}
-                </button>
-              </div>
+            <div className="h-full overflow-y-auto flex flex-col lg:flex-row gap-4 w-full overflow-hidden bg-[var(--card-bg)] rounded-lg shadow-custom card-japanese">
+              <div className="h-full w-full lg:w-[280px] xl:w-[320px] flex-shrink-0 bg-[var(--background)]/50 rounded-lg rounded-r-none p-5 border-b lg:border-b-0 lg:border-r border-[var(--border-color)] overflow-y-auto">
+                <h3 className="text-lg font-bold text-[var(--foreground)] mb-3 font-serif">{wikiStructure.title}</h3>
+                <p className="text-[var(--muted)] text-sm mb-5 leading-relaxed">{wikiStructure.description}</p>
 
-              {/* Export buttons */}
-              {Object.keys(generatedPages).length > 0 && (
+                <div className="text-xs text-[var(--muted)] mb-5 flex items-center">
+                  {effectiveRepoInfo.type === 'local' ? (
+                    <div className="flex items-center">
+                      <FaFolder className="mr-2" />
+                      <span className="break-all">{effectiveRepoInfo.localPath}</span>
+                    </div>
+                  ) : (
+                    <>
+                      {effectiveRepoInfo.type === 'github' ? (
+                        <FaGithub className="mr-2" />
+                      ) : effectiveRepoInfo.type === 'gitlab' ? (
+                        <FaGitlab className="mr-2" />
+                      ) : (
+                        <FaBitbucket className="mr-2" />
+                      )}
+                      <a
+                        href={effectiveRepoInfo.repoUrl ?? ''}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="hover:text-[var(--accent-primary)] transition-colors border-b border-[var(--border-color)] hover:border-[var(--accent-primary)]"
+                      >
+                        {effectiveRepoInfo.owner}/{effectiveRepoInfo.repo}
+                      </a>
+                    </>
+                  )}
+                </div>
+
+                <div className="mb-3 flex items-center text-xs text-[var(--muted)]">
+                  <span className="mr-2">Wiki Type:</span>
+                  <span className={`px-2 py-0.5 rounded-full ${isComprehensiveView
+                    ? 'bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] border border-[var(--accent-primary)]/30'
+                    : 'bg-[var(--background)] text-[var(--foreground)] border border-[var(--border-color)]'}`}>
+                    {isComprehensiveView
+                      ? (messages.form?.comprehensive || 'Comprehensive')
+                      : (messages.form?.concise || 'Concise')}
+                  </span>
+                </div>
+
                 <div className="mb-5">
-                  <h4 className="text-sm font-semibold text-[var(--foreground)] mb-3 font-serif">
-                    {messages.repoPage?.exportWiki || 'Export Wiki'}
-                  </h4>
-                  <div className="flex flex-col gap-2">
-                    <button
-                      onClick={() => exportWiki('markdown')}
-                      disabled={isExporting}
-                      className="btn-japanese flex items-center text-xs px-3 py-2 rounded-md disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <FaDownload className="mr-2" />
-                      {messages.repoPage?.exportAsMarkdown || 'Export as Markdown'}
-                    </button>
-                    <button
-                      onClick={() => exportWiki('json')}
-                      disabled={isExporting}
-                      className="flex items-center text-xs px-3 py-2 bg-[var(--background)] text-[var(--foreground)] rounded-md hover:bg-[var(--background)]/80 disabled:opacity-50 disabled:cursor-not-allowed border border-[var(--border-color)] transition-colors"
-                    >
-                      <FaFileExport className="mr-2" />
-                      {messages.repoPage?.exportAsJson || 'Export as JSON'}
-                    </button>
-                  </div>
-                  {exportError && (
-                    <div className="mt-2 text-xs text-[var(--highlight)]">
-                      {exportError}
-                    </div>
-                  )}
+                  <button
+                    onClick={() => setIsModelSelectionModalOpen(true)}
+                    disabled={isLoading || pagesInProgress.size > 0}
+                    className="flex items-center w-full text-xs px-3 py-2 bg-[var(--background)] text-[var(--foreground)] rounded-md hover:bg-[var(--background)]/80 disabled:opacity-50 disabled:cursor-not-allowed border border-[var(--border-color)] transition-colors hover:cursor-pointer"
+                  >
+                    <FaSync className={`mr-2 ${(isLoading || pagesInProgress.size > 0) ? 'animate-spin' : ''}`} />
+                    {messages.repoPage?.refreshWiki || 'Refresh Wiki'}
+                  </button>
                 </div>
-              )}
 
-              <h4 className="text-md font-semibold text-[var(--foreground)] mb-3 font-serif">
-                {messages.repoPage?.pages || 'Pages'}
-              </h4>
-              <WikiTreeView
-                wikiStructure={wikiStructure}
-                currentPageId={currentPageId}
-                onPageSelect={handlePageSelect}
-                messages={messages.repoPage}
-              />
-            </div>
-
-            {/* Wiki Content */}
-            <div id="wiki-content" className="w-full flex-grow p-6 lg:p-8 overflow-y-auto">
-              {currentPageId && generatedPages[currentPageId] ? (
-                <div className="max-w-[900px] xl:max-w-[1000px] mx-auto">
-                  <h3 className="text-xl font-bold text-[var(--foreground)] mb-4 break-words font-serif">
-                    {generatedPages[currentPageId].title}
-                  </h3>
-
-
-
-                  <div className="prose prose-sm md:prose-base lg:prose-lg max-w-none">
-                    <Markdown
-                      content={generatedPages[currentPageId].content}
-                    />
-                  </div>
-
-                  {generatedPages[currentPageId].relatedPages.length > 0 && (
-                    <div className="mt-8 pt-4 border-t border-[var(--border-color)]">
-                      <h4 className="text-sm font-semibold text-[var(--muted)] mb-3">
-                        {messages.repoPage?.relatedPages || 'Related Pages:'}
-                      </h4>
-                      <div className="flex flex-wrap gap-2">
-                        {generatedPages[currentPageId].relatedPages.map(relatedId => {
-                          const relatedPage = wikiStructure.pages.find(p => p.id === relatedId);
-                          return relatedPage ? (
-                            <button
-                              key={relatedId}
-                              className="bg-[var(--accent-primary)]/10 hover:bg-[var(--accent-primary)]/20 text-xs text-[var(--accent-primary)] px-3 py-1.5 rounded-md transition-colors truncate max-w-full border border-[var(--accent-primary)]/20"
-                              onClick={() => handlePageSelect(relatedId)}
-                            >
-                              {relatedPage.title}
-                            </button>
-                          ) : null;
-                        })}
+                {Object.keys(generatedPages).length > 0 && (
+                  <div className="mb-5">
+                    <h4 className="text-sm font-semibold text-[var(--foreground)] mb-3 font-serif">
+                      {messages.repoPage?.exportWiki || 'Export Wiki'}
+                    </h4>
+                    <div className="flex flex-col gap-2">
+                      <button
+                        onClick={() => exportWiki('markdown')}
+                        disabled={isExporting}
+                        className="btn-japanese flex items-center text-xs px-3 py-2 rounded-md disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <FaDownload className="mr-2" />
+                        {messages.repoPage?.exportAsMarkdown || 'Export as Markdown'}
+                      </button>
+                      <button
+                        onClick={() => exportWiki('json')}
+                        disabled={isExporting}
+                        className="flex items-center text-xs px-3 py-2 bg-[var(--background)] text-[var(--foreground)] rounded-md hover:bg-[var(--background)]/80 disabled:opacity-50 disabled:cursor-not-allowed border border-[var(--border-color)] transition-colors"
+                      >
+                        <FaFileExport className="mr-2" />
+                        {messages.repoPage?.exportAsJson || 'Export as JSON'}
+                      </button>
+                    </div>
+                    {exportError && (
+                      <div className="mt-2 text-xs text-[var(--highlight)]">
+                        {exportError}
                       </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="flex flex-col items-center justify-center p-8 text-[var(--muted)] h-full">
-                  <div className="relative mb-4">
-                    <div className="absolute -inset-2 bg-[var(--accent-primary)]/5 rounded-full blur-md"></div>
-                    <FaBookOpen className="text-4xl relative z-10" />
+                    )}
                   </div>
-                  <p className="font-serif">
-                    {messages.repoPage?.selectPagePrompt || 'Select a page from the navigation to view its content'}
-                  </p>
-                </div>
-              )}
+                )}
+
+                <h4 className="text-md font-semibold text-[var(--foreground)] mb-3 font-serif">
+                  {messages.repoPage?.pages || 'Pages'}
+                </h4>
+                <WikiTreeView
+                  wikiStructure={wikiStructure}
+                  currentPageId={currentPageId}
+                  onPageSelect={handlePageSelect}
+                  messages={messages.repoPage}
+                />
+              </div>
+
+              <div id="wiki-content" className="w-full flex-grow p-6 lg:p-8 overflow-y-auto">
+                {currentPageId && generatedPages[currentPageId] ? (
+                  <div className="max-w-[900px] xl:max-w-[1000px] mx-auto">
+                    <h3 className="text-xl font-bold text-[var(--foreground)] mb-4 break-words font-serif">
+                      {generatedPages[currentPageId].title}
+                    </h3>
+
+                    <div className="prose prose-sm md:prose-base lg:prose-lg max-w-none">
+                      <Markdown
+                        content={generatedPages[currentPageId].content}
+                      />
+                    </div>
+
+                    {generatedPages[currentPageId].relatedPages.length > 0 && (
+                      <div className="mt-8 pt-4 border-t border-[var(--border-color)]">
+                        <h4 className="text-sm font-semibold text-[var(--muted)] mb-3">
+                          {messages.repoPage?.relatedPages || 'Related Pages:'}
+                        </h4>
+                        <div className="flex flex-wrap gap-2">
+                          {generatedPages[currentPageId].relatedPages.map(relatedId => {
+                            const relatedPage = wikiStructure.pages.find(p => p.id === relatedId);
+                            return relatedPage ? (
+                              <button
+                                key={relatedId}
+                                className="bg-[var(--accent-primary)]/10 hover:bg-[var(--accent-primary)]/20 text-xs text-[var(--accent-primary)] px-3 py-1.5 rounded-md transition-colors truncate max-w-full border border-[var(--accent-primary)]/20"
+                                onClick={() => handlePageSelect(relatedId)}
+                              >
+                                {relatedPage.title}
+                              </button>
+                            ) : null;
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center p-8 text-[var(--muted)] h-full">
+                    <div className="relative mb-4">
+                      <div className="absolute -inset-2 bg-[var(--accent-primary)]/5 rounded-full blur-md"></div>
+                      <FaBookOpen className="text-4xl relative z-10" />
+                    </div>
+                    <p className="font-serif">
+                      {messages.repoPage?.selectPagePrompt || 'Select a page from the navigation to view its content'}
+                    </p>
+                  </div>
+                )}
+              </div>
             </div>
+          </div>
+        ) : isLoading ? (
+          <div className="flex flex-col items-center justify-center p-8 bg-[var(--card-bg)] rounded-lg shadow-custom card-japanese">
+            <div className="relative mb-6">
+              <div className="absolute -inset-4 bg-[var(--accent-primary)]/10 rounded-full blur-md animate-pulse"></div>
+              <div className="relative flex items-center justify-center">
+                <div className="w-3 h-3 bg-[var(--accent-primary)]/70 rounded-full animate-pulse"></div>
+                <div className="w-3 h-3 bg-[var(--accent-primary)]/70 rounded-full animate-pulse delay-75 mx-2"></div>
+                <div className="w-3 h-3 bg-[var(--accent-primary)]/70 rounded-full animate-pulse delay-150"></div>
+              </div>
+            </div>
+            <p className="text-[var(--foreground)] text-center mb-3 font-serif">
+              {loadingMessage || messages.common?.loading || 'Loading...'}
+              {isExporting && (messages.loading?.preparingDownload || ' Please wait while we prepare your download...')}
+            </p>
           </div>
         ) : null}
       </main>
-
       <footer className="max-w-[90%] xl:max-w-[1400px] mx-auto mt-8 flex flex-col gap-4 w-full">
         <div className="flex justify-between items-center gap-4 text-center text-[var(--muted)] text-sm h-fit w-full bg-[var(--card-bg)] rounded-lg p-3 shadow-sm border border-[var(--border-color)]">
           <p className="flex-1 font-serif">
