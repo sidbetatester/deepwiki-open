@@ -23,6 +23,7 @@
 - **Smart Analysis**: AI-powered understanding of code structure and relationships
 - **Beautiful Diagrams**: Automatic Mermaid diagrams to visualize architecture and data flow
 - **Easy Navigation**: Simple, intuitive interface to explore the wiki
+- **Live Page Generation Feedback**: Streamed updates, progress tracking, and automatic retries while content is being created
 - **Ask Feature**: Chat with your repository using RAG-powered AI to get accurate answers
 - **DeepResearch**: Multi-turn research process that thoroughly investigates complex topics
 - **Multiple Model Providers**: Support for Google Gemini, OpenAI, OpenRouter, and local Ollama models

@@ -90,6 +90,13 @@ const wikiStyles = `
 const MAX_PAGE_GENERATION_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1500;
 const RETRY_MAX_DELAY_MS = 8000;
+const STREAM_UPDATE_THROTTLE_MS = 250;
+
+const sanitizeMarkdown = (content: string): string => {
+  return content
+    .replace(/^```(?:markdown)?\s*/i, '')
+    .replace(/```\s*$/i, '');
+};
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -266,6 +273,10 @@ export default function RepoWikiPage() {
   // Create a flag to track if data was loaded from cache to prevent immediate re-save
   const cacheLoadedSuccessfully = useRef(false);
 
+  const streamUpdateTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const pendingStreamContent = useRef<Record<string, string>>({});
+  const lastStreamUpdate = useRef<Record<string, number>>({});
+
   // Create a flag to ensure the effect only runs once
   const effectRan = React.useRef(false);
 
@@ -326,6 +337,19 @@ export default function RepoWikiPage() {
     }
   }, [currentPageId]);
 
+  useEffect(() => {
+    return () => {
+      Object.values(streamUpdateTimers.current).forEach(timer => {
+        if (timer !== undefined) {
+          window.clearTimeout(timer);
+        }
+      });
+      streamUpdateTimers.current = {};
+      pendingStreamContent.current = {};
+      lastStreamUpdate.current = {};
+    };
+  }, [streamUpdateTimers, pendingStreamContent, lastStreamUpdate]);
+
   // close the modal when escape is pressed
   useEffect(() => {
     const handleEsc = (event: KeyboardEvent) => {
@@ -367,6 +391,63 @@ export default function RepoWikiPage() {
     fetchAuthStatus();
   }, []);
 
+  const pushStreamingUpdate = useCallback((page: WikiPage, aggregatedContent: string, isFinal: boolean = false) => {
+    const pageId = page.id;
+    const sanitized = sanitizeMarkdown(aggregatedContent);
+
+    if (!isFinal && sanitized === '') {
+      return;
+    }
+
+    const commitUpdate = (contentToCommit: string) => {
+      setGeneratedPages(prev => ({
+        ...prev,
+        [pageId]: {
+          ...(prev[pageId] ?? page),
+          ...page,
+          content: contentToCommit
+        }
+      }));
+    };
+
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+    if (isFinal) {
+      const pendingTimer = streamUpdateTimers.current[pageId];
+      if (pendingTimer !== undefined) {
+        window.clearTimeout(pendingTimer);
+        delete streamUpdateTimers.current[pageId];
+      }
+      delete pendingStreamContent.current[pageId];
+      commitUpdate(sanitized);
+      lastStreamUpdate.current[pageId] = now;
+      return;
+    }
+
+    const lastUpdate = lastStreamUpdate.current[pageId] ?? 0;
+
+    if (now - lastUpdate >= STREAM_UPDATE_THROTTLE_MS) {
+      commitUpdate(sanitized);
+      lastStreamUpdate.current[pageId] = now;
+      return;
+    }
+
+    pendingStreamContent.current[pageId] = sanitized;
+
+    if (streamUpdateTimers.current[pageId] === undefined) {
+      const delay = Math.max(STREAM_UPDATE_THROTTLE_MS - (now - lastUpdate), 16);
+      streamUpdateTimers.current[pageId] = window.setTimeout(() => {
+        const buffered = pendingStreamContent.current[pageId];
+        if (buffered !== undefined) {
+          commitUpdate(buffered);
+          lastStreamUpdate.current[pageId] = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          delete pendingStreamContent.current[pageId];
+        }
+        delete streamUpdateTimers.current[pageId];
+      }, delay);
+    }
+  }, [setGeneratedPages]);
+
   // Generate content for a wiki page
   const generatePageContent = useCallback(async (page: WikiPage, owner: string, repo: string) => {
     let success = false;
@@ -398,6 +479,14 @@ export default function RepoWikiPage() {
         [page.id]: { ...page, content: 'Loading...' }
       }));
       setOriginalMarkdown(prev => ({ ...prev, [page.id]: '' }));
+
+      const existingTimer = streamUpdateTimers.current[page.id];
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+        delete streamUpdateTimers.current[page.id];
+      }
+      delete pendingStreamContent.current[page.id];
+      lastStreamUpdate.current[page.id] = 0;
 
       console.log(`Starting content generation for page: ${page.title}`);
 
@@ -519,100 +608,131 @@ Remember:
         modelIncludedFiles
       );
 
-      const fetchContent = async (): Promise<string> => {
-        let content = '';
+      const fetchContent = async (
+        onUpdate: (aggregatedContent: string, isFinal: boolean) => void
+      ): Promise<string> => {
+        const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
+        const wsBaseUrl = serverBaseUrl.startsWith('https')
+          ? serverBaseUrl.replace(/^https/, 'wss')
+          : serverBaseUrl.replace(/^http/, 'ws');
+        const wsUrl = `${wsBaseUrl}/ws/chat`;
+
+        const attemptWebSocket = (): Promise<string> =>
+          new Promise((resolve, reject) => {
+            let aggregated = '';
+            let settled = false;
+
+            const finalizeResolve = () => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              onUpdate(aggregated, true);
+              resolve(aggregated);
+            };
+
+            const finalizeReject = (error: Error) => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              reject(error);
+            };
+
+            try {
+              const ws = new WebSocket(wsUrl);
+              const timeout = window.setTimeout(() => {
+                finalizeReject(new Error('WebSocket connection timeout'));
+                try {
+                  ws.close();
+                } catch (closeError) {
+                  console.warn('Error closing timed out WebSocket:', closeError);
+                }
+              }, 5000);
+
+              ws.onopen = () => {
+                window.clearTimeout(timeout);
+                console.log(`WebSocket connection established for page: ${page.title}`);
+                ws.send(JSON.stringify(requestBody));
+              };
+
+              ws.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                  aggregated += event.data;
+                  onUpdate(aggregated, false);
+                }
+              };
+
+              ws.onerror = (error) => {
+                window.clearTimeout(timeout);
+                console.error('WebSocket error:', error);
+                finalizeReject(new Error('WebSocket connection failed'));
+                try {
+                  ws.close();
+                } catch (closeError) {
+                  console.warn('Error closing failed WebSocket:', closeError);
+                }
+              };
+
+              ws.onclose = () => {
+                window.clearTimeout(timeout);
+                console.log(`WebSocket connection closed for page: ${page.title}`);
+                finalizeResolve();
+              };
+            } catch (err) {
+              finalizeReject(err instanceof Error ? err : new Error('WebSocket initialization failed'));
+            }
+          });
 
         try {
-          const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
-          const wsBaseUrl = serverBaseUrl.startsWith('https')
-            ? serverBaseUrl.replace(/^https/, 'wss')
-            : serverBaseUrl.replace(/^http/, 'ws');
-          const wsUrl = `${wsBaseUrl}/ws/chat`;
-
-          const ws = new WebSocket(wsUrl);
-
-          await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => {
-              ws.close();
-              reject(new Error('WebSocket connection timeout'));
-            }, 5000);
-
-            ws.onopen = () => {
-              clearTimeout(timeout);
-              console.log(`WebSocket connection established for page: ${page.title}`);
-              ws.send(JSON.stringify(requestBody));
-              resolve();
-            };
-
-            ws.onerror = (error) => {
-              clearTimeout(timeout);
-              ws.close();
-              console.error('WebSocket error:', error);
-              reject(new Error('WebSocket connection failed'));
-            };
-          });
-
-          await new Promise<void>((resolve, reject) => {
-            ws.onmessage = (event) => {
-              content += event.data;
-            };
-
-            ws.onclose = () => {
-              console.log(`WebSocket connection closed for page: ${page.title}`);
-              resolve();
-            };
-
-            ws.onerror = (error) => {
-              console.error('WebSocket error during message reception:', error);
-              ws.close();
-              reject(new Error('WebSocket error during message reception'));
-            };
-          });
-
-          if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-            ws.close();
-          }
-
-          return content;
+          return await attemptWebSocket();
         } catch (wsError) {
           console.error('WebSocket error, falling back to HTTP:', wsError);
-
-          const response = await fetch(`/api/chat/stream`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestBody)
-          });
-
-          if (!response.ok) {
-            const errorText = await response.text().catch(() => 'No error details available');
-            console.error(`API error (${response.status}): ${errorText}`);
-            throw new Error(`Error generating page content: ${response.status} - ${response.statusText}`);
-          }
-
-          const reader = response.body?.getReader();
-          const decoder = new TextDecoder();
-
-          if (!reader) {
-            throw new Error('Failed to get response reader');
-          }
-
-          content = '';
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              content += decoder.decode(value, { stream: true });
-            }
-            content += decoder.decode();
-          } catch (readError) {
-            console.error('Error reading stream:', readError);
-            throw new Error('Error processing response stream');
-          }
-
-          return content;
         }
+
+        const response = await fetch(`/api/chat/stream`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => 'No error details available');
+          console.error(`API error (${response.status}): ${errorText}`);
+          throw new Error(`Error generating page content: ${response.status} - ${response.statusText}`);
+        }
+
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        if (!reader) {
+          throw new Error('Failed to get response reader');
+        }
+
+        let aggregated = '';
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value, { stream: true });
+            if (chunk) {
+              aggregated += chunk;
+              onUpdate(aggregated, false);
+            }
+          }
+          const finalChunk = decoder.decode();
+          if (finalChunk) {
+            aggregated += finalChunk;
+          }
+          onUpdate(aggregated, true);
+        } catch (readError) {
+          console.error('Error reading stream:', readError);
+          throw new Error('Error processing response stream');
+        }
+
+        return aggregated;
       };
 
       let attempt = 1;
@@ -628,8 +748,10 @@ Remember:
             }));
           }
 
-          let content = await fetchContent();
-          content = content.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
+          const rawContent = await fetchContent((aggregated, isFinalChunk) => {
+            pushStreamingUpdate(page, aggregated, isFinalChunk);
+          });
+          const content = sanitizeMarkdown(rawContent);
 
           console.log(`Received content for ${page.title}, length: ${content.length} characters`);
 
@@ -688,7 +810,7 @@ Remember:
       });
       setLoadingMessage(undefined);
     }
-  }, [generatedPages, failedPages, currentToken, effectiveRepoInfo, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, language, activeContentRequests, generateFileUrl]);
+  }, [generatedPages, failedPages, currentToken, effectiveRepoInfo, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, language, activeContentRequests, generateFileUrl, pushStreamingUpdate, streamUpdateTimers, pendingStreamContent]);
   // Determine the wiki structure from repository data
   const determineWikiStructure = useCallback(async (fileTree: string, readme: string, owner: string, repo: string) => {
     if (!owner || !repo) {
