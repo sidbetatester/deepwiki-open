@@ -112,7 +112,15 @@
       "relatedFiles": "관련 파일:",
       "relatedPages": "관련 페이지:",
       "selectPagePrompt": "목록에서 페이지를 선택하여 내용을 확인하세요",
-      "askAboutRepo": "이 저장소에 대해 질문하기"
+      "askAboutRepo": "이 저장소에 대해 질문하기",
+      "generatingPages": "위키 페이지를 생성하는 중...",
+      "pagesCompleted": "총 {total}페이지 중 {completed}페이지 완료",
+      "currentlyProcessing": "현재 처리 중:",
+      "andMorePages": "...그리고 {count}개 더",
+      "partialGenerationWarning": "일부 페이지는 아직 생성되지 않았습니다.",
+      "partialGenerationDescription": "남은 페이지 생성을 다시 시도할 수 있습니다. 실패한 페이지는 재생성에 성공할 때까지 현재 내용으로 표시됩니다.",
+      "failedAttemptCount": "시도 횟수: {count}",
+      "retryFailedPages": "실패한 페이지 다시 시도"
     },
     "nav": {
       "wikiProjects": "프로젝트 목록"

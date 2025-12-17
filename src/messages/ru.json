@@ -121,7 +121,15 @@
     "relatedFiles": "Связанные файлы:",
     "relatedPages": "Связанные страницы:",
     "selectPagePrompt": "Выберите страницу в навигации для просмотра её содержимого",
-    "askAboutRepo": "Задайте вопросы об этом репозитории"
+    "askAboutRepo": "Задайте вопросы об этом репозитории",
+    "generatingPages": "Генерация страниц wiki...",
+    "pagesCompleted": "Завершено {completed} из {total} страниц",
+    "currentlyProcessing": "Сейчас обрабатывается:",
+    "andMorePages": "...и ещё {count}",
+    "partialGenerationWarning": "Некоторые страницы пока не удалось сгенерировать.",
+    "partialGenerationDescription": "Вы можете повторно попытаться сгенерировать оставшиеся страницы. Неудачные страницы останутся доступными с текущим содержимым до успешной регенерации.",
+    "failedAttemptCount": "Попыток: {count}",
+    "retryFailedPages": "Повторить попытку для неудачных страниц"
   },
   "nav": {
     "wikiProjects": "Проекты Wiki"
