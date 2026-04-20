@@ -121,7 +121,15 @@
       "relatedFiles": "Fichiers associés :",
       "relatedPages": "Pages associées :",
       "selectPagePrompt": "Sélectionnez une page dans la navigation pour en voir le contenu",
-      "askAboutRepo": "Poser des questions sur ce dépôt"
+      "askAboutRepo": "Poser des questions sur ce dépôt",
+      "generatingPages": "Génération des pages du wiki...",
+      "pagesCompleted": "{completed} pages sur {total} terminées",
+      "currentlyProcessing": "Actuellement en cours :",
+      "andMorePages": "...et {count} de plus",
+      "partialGenerationWarning": "Certaines pages n'ont pas encore pu être générées.",
+      "partialGenerationDescription": "Vous pouvez réessayer de générer les pages restantes. Les pages en échec resteront accessibles avec leur contenu actuel jusqu'à ce que la régénération réussisse.",
+      "failedAttemptCount": "Tentatives : {count}",
+      "retryFailedPages": "Réessayer les pages en échec"
     },
     "nav": {
       "wikiProjects": "Projets Wiki"

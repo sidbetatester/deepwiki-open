@@ -112,7 +112,15 @@
     "relatedFiles": "Tệp liên quan:",
     "relatedPages": "Trang liên quan:",
     "selectPagePrompt": "Chọn một trang từ thanh điều hướng để xem nội dung của nó",
-    "askAboutRepo": "Hỏi về repository này"
+    "askAboutRepo": "Hỏi về repository này",
+    "generatingPages": "Đang tạo các trang wiki...",
+    "pagesCompleted": "Đã hoàn thành {completed}/{total} trang",
+    "currentlyProcessing": "Đang xử lý:",
+    "andMorePages": "...và {count} trang khác",
+    "partialGenerationWarning": "Một số trang chưa thể được tạo.",
+    "partialGenerationDescription": "Bạn có thể thử tạo lại các trang còn lại. Các trang lỗi vẫn có thể truy cập với nội dung hiện tại cho đến khi tạo lại thành công.",
+    "failedAttemptCount": "Số lần thử: {count}",
+    "retryFailedPages": "Thử lại các trang lỗi"
   },
   "nav": {
     "wikiProjects": "Danh sách dự án"

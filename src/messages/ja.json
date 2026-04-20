@@ -112,7 +112,15 @@
     "relatedFiles": "関連ファイル:",
     "relatedPages": "関連ページ:",
     "selectPagePrompt": "ナビゲーションからページを選択してコンテンツを表示",
-    "askAboutRepo": "このリポジトリについて質問する"
+    "askAboutRepo": "このリポジトリについて質問する",
+    "generatingPages": "ウィキページを生成しています...",
+    "pagesCompleted": "{total}ページ中{completed}ページ完了",
+    "currentlyProcessing": "処理中:",
+    "andMorePages": "...ほか{count}ページ",
+    "partialGenerationWarning": "一部のページはまだ生成できていません。",
+    "partialGenerationDescription": "残りのページの生成を再試行できます。失敗したページも再生成に成功するまで現在の内容のまま表示されます。",
+    "failedAttemptCount": "試行回数: {count}",
+    "retryFailedPages": "失敗したページを再試行"
   },
   "nav": {
     "wikiProjects": "プロジェクト一覧"
